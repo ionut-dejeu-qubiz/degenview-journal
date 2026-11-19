@@ -138,6 +138,18 @@ impl DegenViewApp {
                             .commit(&store, alert, baseline, now_ms());
                     }
                 }
+                AppAction::SaveRectangleAlert(alert) => {
+                    let store = crate::lock::lock(&self.store);
+                    if let Err(error) =
+                        self.alerts
+                            .registration()
+                            .commit_rectangle(&store, alert, now_ms())
+                    {
+                        crate::lock::lock(self.alerts.host()).set_rectangle_error(Some(format!(
+                            "Rectangle alert could not be saved: {error}"
+                        )));
+                    }
+                }
                 AppAction::SetAlertState { id, state } => {
                     if let Ok(store) = self.store.lock() {
                         let _ = store.enqueue_alert_command(&AlertRuntimeCommand::new(

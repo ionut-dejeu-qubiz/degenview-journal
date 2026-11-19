@@ -11,6 +11,7 @@ use crate::host::pine::subscription::PineSubscriptionHost;
 use crate::host::settings::SettingsHost;
 use crate::lock::lock;
 use crate::model::alert::pine::PineAlertState;
+use crate::model::alert::rectangle::{RectangleCommand, RectangleCommandPayload, RectanglePhase};
 use crate::model::alert::{
     AlertCurrency, AlertRuntimeCommand, AlertRuntimeCommandPayload, AlertState,
 };
@@ -22,9 +23,12 @@ use crate::ui::alert::center::{
 };
 use crate::ui::alert::editor::{self, PriceAlertEditorOutcome, PriceAlertEditorState};
 use crate::ui::alert::pine_editor::{self, PineAlertWebhooksOutcome, PineAlertWebhooksState};
+use crate::ui::alert::rectangle_editor::{
+    self, RectangleAlertEditorOutcome, RectangleAlertEditorState,
+};
 use crate::ui::alert::script_list::ScriptAlertRow;
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +44,8 @@ struct AlertsWindowState {
     center: AlertCenterState,
     /// The price-alert editor its Edit opened.
     editor: Option<PriceAlertEditorState>,
+    /// The rectangle-alert editor its Rectangles tab opened.
+    rectangle_editor: Option<RectangleAlertEditorState>,
     /// The Webhooks… sheet open on a script alert, by subscription id.
     script_webhooks: Option<(u64, PineAlertWebhooksState)>,
     /// `chart_id → (symbol_key, timeframe)` of every open chart, refreshed each frame for the
@@ -146,12 +152,48 @@ fn show(ui: &mut egui::Ui, env: &AlertsWindowEnv) {
         })
         .collect();
     let muted = store.muted_alerts_cached();
+    let rectangle_alerts = match store.rectangle_alerts_cached() {
+        Ok(alerts) => alerts,
+        Err(error) => {
+            if let Ok(mut host) = env.alert_host.lock() {
+                host.set_rectangle_error(Some(format!(
+                    "Rectangle alerts could not be read: {error}"
+                )));
+            }
+            Arc::new(Vec::new())
+        }
+    };
+    let rectangle_checkpoints = match store.rectangle_checkpoints_cached() {
+        Ok(checkpoints) => checkpoints,
+        Err(error) => {
+            if let Ok(mut host) = env.alert_host.lock() {
+                host.set_rectangle_error(Some(format!(
+                    "Rectangle alert status could not be read: {error}"
+                )));
+            }
+            Arc::new(Vec::new())
+        }
+    };
+    let rectangle_muted = match store.muted_rectangle_alerts_cached() {
+        Ok(muted) => muted,
+        Err(error) => {
+            if let Ok(mut host) = env.alert_host.lock() {
+                host.set_rectangle_error(Some(format!(
+                    "Rectangle alert watch state could not be read: {error}"
+                )));
+            }
+            Arc::new(HashSet::new())
+        }
+    };
     let sync_enabled = store.sync_enabled();
     let actions = if let Ok(host) = env.alert_host.lock() {
         let snapshot = host.snapshot();
         let input = AlertCenterInput {
-            load_error: host.load_error(),
+            load_error: host.load_error().or_else(|| host.rectangle_error()),
             alerts: &snapshot.alerts,
+            rectangle_alerts: &rectangle_alerts,
+            rectangle_checkpoints: &rectangle_checkpoints,
+            rectangle_muted: &rectangle_muted,
             history: &snapshot.history,
             health: &snapshot.health,
             quote: &|key| {
@@ -277,6 +319,68 @@ fn show(ui: &mut egui::Ui, env: &AlertsWindowEnv) {
                     window.editor = Some(editor);
                 }
             }
+            AlertCenterAction::EditRectangle(id) => {
+                if let Some(alert) = rectangle_alerts
+                    .iter()
+                    .find(|alert| alert.id == id)
+                    .cloned()
+                {
+                    window.rectangle_editor = Some(RectangleAlertEditorState::edit(alert));
+                }
+            }
+            AlertCenterAction::ToggleRectangle(id) => {
+                let phase = rectangle_checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == id)
+                    .map(|checkpoint| checkpoint.phase);
+                if let Some(mut alert) = rectangle_alerts
+                    .iter()
+                    .find(|alert| alert.id == id)
+                    .cloned()
+                    && let Some(
+                        phase @ (RectanglePhase::Scheduled
+                        | RectanglePhase::Active
+                        | RectanglePhase::Paused),
+                    ) = phase
+                {
+                    alert.paused = phase != RectanglePhase::Paused;
+                    if let Err(error) = store.enqueue_rectangle_command(&RectangleCommand::new(
+                        RectangleCommandPayload::Save(Box::new(alert)),
+                        now_ms(),
+                    )) && let Ok(mut host) = env.alert_host.lock()
+                    {
+                        host.set_rectangle_error(Some(format!(
+                            "Rectangle alert could not be updated: {error}"
+                        )));
+                    }
+                }
+            }
+            AlertCenterAction::DeleteRectangle(id) => {
+                if let Err(error) = store.enqueue_rectangle_command(&RectangleCommand::new(
+                    RectangleCommandPayload::Delete(id),
+                    now_ms(),
+                )) && let Ok(mut host) = env.alert_host.lock()
+                {
+                    host.set_rectangle_error(Some(format!(
+                        "Rectangle alert could not be deleted: {error}"
+                    )));
+                }
+            }
+            AlertCenterAction::SetRectangleEvaluation(id, watch) => {
+                let key = format!("rectangle:{id}");
+                let origin = store
+                    .alert_local(&key)
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "local".to_owned(), |(_, origin)| origin);
+                if let Err(error) = store.set_alert_local(&key, watch, &origin)
+                    && let Ok(mut host) = env.alert_host.lock()
+                {
+                    host.set_rectangle_error(Some(format!(
+                        "Rectangle alert watch state could not be saved: {error}"
+                    )));
+                }
+            }
             AlertCenterAction::Duplicate(id) => {
                 // A copy of the rule, saved at once as a new, active alert.
                 let original = env.alert_host.lock().ok().and_then(|host| {
@@ -387,5 +491,34 @@ fn show(ui: &mut egui::Ui, env: &AlertsWindowEnv) {
     if slot.is_none() {
         env.quote_coordinator
             .release(editor::ALERTS_WINDOW_QUOTE_OWNER);
+    }
+
+    let mut finished = false;
+    if let Some(state) = window.rectangle_editor.as_mut() {
+        let endpoints = store.webhook_endpoints_cached();
+        let now = now_ms();
+        match rectangle_editor::show(ui.ctx(), state, &endpoints, now) {
+            Some(RectangleAlertEditorOutcome::Create(alert))
+            | Some(RectangleAlertEditorOutcome::Save(alert)) => {
+                if let Err(error) = env.registration.commit_rectangle(&store, alert, now)
+                    && let Ok(mut host) = env.alert_host.lock()
+                {
+                    host.set_rectangle_error(Some(format!(
+                        "Rectangle alert could not be saved: {error}"
+                    )));
+                }
+                finished = true;
+            }
+            Some(RectangleAlertEditorOutcome::Cancel) => finished = true,
+            Some(RectangleAlertEditorOutcome::OpenWebhookSettings) => {
+                if let Ok(mut host) = env.settings_host.lock() {
+                    host.open_webhooks();
+                }
+            }
+            None => {}
+        }
+    }
+    if finished {
+        window.rectangle_editor = None;
     }
 }

@@ -605,7 +605,9 @@ mod tests {
         let mut engine = AlertEngine::new(None);
         let alert = PriceAlert::new(
             asset("BTCUSDT"),
-            AlertCondition::Unsupported { tag: "x".into() },
+            AlertCondition::Unsupported {
+                payload: serde_json::json!({"tag": "x"}),
+            },
             T0,
         );
         engine.save_alert(alert, Some(1.0), T0);

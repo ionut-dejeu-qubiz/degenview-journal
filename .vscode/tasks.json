@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build (debugger)",
+            "type": "shell",
+            "command": "call \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" && cargo build --locked --bin degenview --target-dir \"${workspaceFolder}\\target-debug\"",
+            "options": {
+                "shell": {
+                    "executable": "${env:ComSpec}",
+                    "args": ["/d", "/c"]
+                },
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "CARGO_PROFILE_DEV_DEBUG": "2"
+                }
+            },
+            "problemMatcher": ["$rustc"],
+            "group": "build"
+        }
+    ]
+}

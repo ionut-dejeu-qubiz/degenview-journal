@@ -4,9 +4,13 @@ use super::chart::Chart;
 use super::{ChartWorkspace, WorkspaceAction};
 use crate::model::DataSource;
 use crate::model::alert::draft::Direction;
+use crate::model::alert::rectangle::RectangleAlert;
 use crate::model::alert::{AlertAsset, AlertCurrency, PriceAlert};
 use crate::model::watchlist::now_ms;
 use crate::ui::alert::editor::{self, PriceAlertEditorOutcome, PriceAlertEditorState};
+use crate::ui::alert::rectangle_editor::{
+    self, RectangleAlertEditorOutcome, RectangleAlertEditorState,
+};
 use eframe::egui;
 use std::collections::HashMap;
 
@@ -40,6 +44,8 @@ pub(super) struct AlertUi {
     request: Option<AlertRequest>,
     /// The "Create Price Alert" sheet, over this tab's window.
     editor: Option<PriceAlertEditorState>,
+    /// The review sheet for a time-boxed alert copied from an ordinary rectangle.
+    rectangle_editor: Option<RectangleAlertEditorState>,
     /// USD → currency rates for the sheet's currency menu, pushed in by the app.
     fx_rates: HashMap<AlertCurrency, f64>,
 }
@@ -93,6 +99,41 @@ impl AlertUi {
 }
 
 impl ChartWorkspace {
+    /// Opens a review sheet for an alert copied from a rectangle drawing. The definition receives
+    /// its own bounds and does not retain a link to the drawing.
+    pub(super) fn start_rectangle_alert_from_drawing(
+        &mut self,
+        chart_id: u64,
+        a: crate::model::Anchor,
+        b: crate::model::Anchor,
+    ) {
+        let Some(chart) = self.charts.iter().find(|chart| chart.id == chart_id) else {
+            return;
+        };
+        if !chart.is_market() || !crate::ui::supports_alerts(chart.source) {
+            self.say("Rectangle alerts are not available for this market.", true);
+            return;
+        }
+        if self.replay.is_active() {
+            self.say("Rectangle alerts are not available during replay.", true);
+            return;
+        }
+        let alert = RectangleAlert::new_live_touch(
+            Self::alert_asset(chart),
+            a.time_ms.min(b.time_ms),
+            a.time_ms.max(b.time_ms),
+            a.price.min(b.price),
+            a.price.max(b.price),
+            now_ms(),
+        );
+        match alert {
+            Ok(alert) => {
+                self.alerts.rectangle_editor = Some(RectangleAlertEditorState::new(alert));
+            }
+            Err(error) => self.say(error, true),
+        }
+    }
+
     /// How many alerts have fired since the Alerts window was last looked at, for the bell.
     pub fn set_unseen_alerts(&mut self, count: usize) {
         self.alerts.unseen = count;
@@ -129,6 +170,9 @@ impl ChartWorkspace {
                     };
             }
             self.alerts.editor = Some(editor);
+        }
+        if self.alerts.editor.is_none() {
+            return self.show_rectangle_alert_editor(ctx);
         }
         let Some(state) = self.alerts.editor.as_mut() else {
             return Vec::new();
@@ -167,6 +211,39 @@ impl ChartWorkspace {
         actions
     }
 
+    fn show_rectangle_alert_editor(&mut self, ctx: &egui::Context) -> Vec<WorkspaceAction> {
+        let Some(state) = self.alerts.rectangle_editor.as_mut() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        let endpoints = self
+            .store
+            .lock()
+            .map(|store| store.webhook_endpoints_cached())
+            .unwrap_or_default();
+        let now = now_ms();
+        let mut finished = false;
+        match rectangle_editor::show(ctx, state, &endpoints, now) {
+            Some(RectangleAlertEditorOutcome::Create(alert)) => {
+                actions.push(WorkspaceAction::SaveRectangleAlert(alert));
+                finished = true;
+            }
+            Some(RectangleAlertEditorOutcome::Save(alert)) => {
+                actions.push(WorkspaceAction::SaveRectangleAlert(alert));
+                finished = true;
+            }
+            Some(RectangleAlertEditorOutcome::Cancel) => finished = true,
+            Some(RectangleAlertEditorOutcome::OpenWebhookSettings) => {
+                actions.push(WorkspaceAction::OpenWebhookSettings);
+            }
+            None => {}
+        }
+        if finished {
+            self.alerts.rectangle_editor = None;
+        }
+        actions
+    }
+
     /// The market a chart's bell starts an alert on: its identity, the ticker and a name.
     pub(super) fn alert_asset(chart: &Chart) -> AlertAsset {
         Self::alert_asset_for(&chart.symbol, chart.source)
@@ -186,6 +263,7 @@ impl ChartWorkspace {
 mod tests {
     use super::*;
     use crate::ui;
+    use crate::workspace::test_support::{chart_with_drawings, empty_workspace};
 
     #[test]
     fn the_bell_starts_an_alert_on_the_charts_market() {
@@ -200,5 +278,45 @@ mod tests {
         assert!(!ui::supports_alerts(DataSource::CoinMarketCap));
         assert!(!ui::supports_alerts(DataSource::Polymarket));
         assert!(!ui::supports_alerts(DataSource::Kalshi));
+    }
+
+    #[test]
+    fn a_rectangle_drawing_opens_a_review_copy_with_normalized_bounds() {
+        let mut workspace = empty_workspace(1);
+        let chart_id = chart_with_drawings(&mut workspace, "BTCUSDT", &[]);
+        let now = now_ms();
+        workspace.start_rectangle_alert_from_drawing(
+            chart_id,
+            crate::model::Anchor {
+                time_ms: now + 2_000,
+                price: 20.0,
+            },
+            crate::model::Anchor {
+                time_ms: now + 1_000,
+                price: 10.0,
+            },
+        );
+
+        let alert = &workspace
+            .alerts
+            .rectangle_editor
+            .as_ref()
+            .expect("review sheet")
+            .alert;
+        assert_eq!((alert.start_ms, alert.end_ms), (now + 1_000, now + 2_000));
+        assert_eq!((alert.low, alert.high), (10.0, 20.0));
+        assert_eq!(
+            alert.mode,
+            crate::model::alert::rectangle::RectangleMode::LiveTouch
+        );
+        assert!(
+            workspace
+                .charts
+                .iter()
+                .find(|chart| chart.id == chart_id)
+                .unwrap()
+                .drawings
+                .is_empty()
+        );
     }
 }

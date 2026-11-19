@@ -18,6 +18,7 @@ pub fn tint(tab: AlertTab) -> Color32 {
         AlertTab::All => Color32::from_rgb(10, 132, 255),
         AlertTab::History => Color32::from_rgb(191, 90, 242),
         AlertTab::Scripts => Color32::from_rgb(94, 92, 230),
+        AlertTab::Rectangles => Color32::from_rgb(142, 142, 147),
     }
 }
 
@@ -37,6 +38,7 @@ pub fn paint(ui: &Ui, rect: Rect, tab: AlertTab) {
         AlertTab::All => art.all(),
         AlertTab::History => art.history(),
         AlertTab::Scripts => art.scripts(),
+        AlertTab::Rectangles => art.all(),
     }
 }
 

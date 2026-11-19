@@ -49,6 +49,8 @@ pub enum Load {
     Gone,
     /// Not held in SQLite (scripts are files); the caller must supply it.
     NotStored,
+    /// The alert runtime must apply queued rectangle changes first.
+    Deferred,
 }
 
 impl Store {
@@ -129,6 +131,9 @@ impl Store {
 
     /// The live entity for an outbox entry, projected fresh so a payload is never stale.
     pub fn load_projected(&self, kind: EntityKind, sync_id: &str) -> rusqlite::Result<Load> {
+        if kind == EntityKind::RectangleAlert && self.rectangle_commands_pending()? {
+            return Ok(Load::Deferred);
+        }
         let by_id = |table: &str, id: &str| -> rusqlite::Result<Option<String>> {
             self.connection
                 .query_row(
@@ -194,6 +199,20 @@ impl Store {
                 pick("editor_theme", sync_id, by_id("editor_theme", sync_id)?)
             }
             EntityKind::Alert => pick("price_alert", sync_id, by_id("price_alert", sync_id)?),
+            EntityKind::RectangleAlert => {
+                let payload = by_id("rectangle_alert", sync_id)?;
+                if let Some(payload) = &payload {
+                    serde_json::from_str::<crate::model::alert::rectangle::RectangleAlert>(payload)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                }
+                pick("rectangle_alert", sync_id, payload)
+            }
             EntityKind::Setting => {
                 let value: Option<String> = self
                     .connection

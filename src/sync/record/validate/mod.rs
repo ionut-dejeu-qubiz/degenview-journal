@@ -152,7 +152,7 @@ fn check(record: &SyncRecord, value: &Value) -> Result<(), String> {
             id_matches_number(object, id, kind)?;
             name_ok(object, "name")
         }
-        EntityKind::Alert => {
+        EntityKind::Alert | EntityKind::RectangleAlert => {
             let object = object(value)?;
             id_matches_number(object, id, kind)
         }

@@ -296,6 +296,8 @@ impl ChartWorkspace {
 
         let mut drawing_commands: Vec<(u64, Vec<DrawingCommand>)> = Vec::new();
         let mut drawing_select: Option<(u64, Vec<u64>)> = None;
+        let mut drawing_rectangle_alert: Option<(u64, crate::model::Anchor, crate::model::Anchor)> =
+            None;
         let mut drawing_disarm = false;
         let picture_work = self.content.work_snapshot(self.focused);
         let mut picture_used = false;
@@ -530,6 +532,10 @@ impl ChartWorkspace {
                                             .with_selection(selected)
                                             .with_view(timeframe, hide_all_drawings)
                                             .with_behavior(magnet, keep_drawing)
+                                            .with_rectangle_alerts_available(
+                                                crate::ui::supports_alerts(chart.source)
+                                                    && !replay_active,
+                                            )
                                             .with_style_clipboard(style_clipboard)
                                             .with_keys_blocked(dialog_open)
                                             .with_defaults(&drawing_defaults)
@@ -635,6 +641,9 @@ impl ChartWorkspace {
                                             drawing_copy |= frame.copy_requested;
                                             if let Some(price) = frame.alert_price {
                                                 drawing_alert = Some((chart_id, price));
+                                            }
+                                            if let Some((a, b)) = frame.rectangle_alert_bounds {
+                                                drawing_rectangle_alert = Some((chart_id, a, b));
                                             }
                                             if frame.style_copied.is_some() {
                                                 drawing_style_copied = frame.style_copied;
@@ -933,6 +942,9 @@ impl ChartWorkspace {
         }
         if let Some((chart_id, price)) = drawing_alert {
             self.start_alert_at(chart_id, Some(price));
+        }
+        if let Some((chart_id, a, b)) = drawing_rectangle_alert {
+            self.start_rectangle_alert_from_drawing(chart_id, a, b);
         }
         if let Some((tool, style)) = drawing_style_copied {
             self.tools.copy_style(tool, style);

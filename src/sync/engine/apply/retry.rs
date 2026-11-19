@@ -2,13 +2,55 @@
 //! those whose table can now be rewritten, and those whose category was switched back on.
 
 use super::{
-    DELETE_PENDING, EntityKind, InboxRecord, LOCAL_UNREADABLE, NEWER_SCHEMA, RecordName,
-    RemoteRecord, UNKNOWN_TYPE, Work, category_of, remote_from_inbox, table_of,
+    DELETE_PENDING, EntityKind, InboxRecord, LOCAL_UNREADABLE, NEWER_SCHEMA, RECTANGLE_BUSY,
+    RECTANGLE_DELETE_BUSY, RecordName, RemoteRecord, UNKNOWN_TYPE, Work, category_of,
+    remote_from_inbox, table_of,
 };
 use crate::sync::engine::SyncError;
 use crate::sync::record::validate::{Verdict, validate};
 
 impl Work<'_> {
+    pub(super) fn retry_rectangle_busy(&mut self) -> Result<(), SyncError> {
+        if !self.store.rectangle_sync_waiting()? {
+            return Ok(());
+        }
+        let waiting: Vec<InboxRecord> = self
+            .store
+            .inbox()?
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.reason.as_str(),
+                    RECTANGLE_BUSY | RECTANGLE_DELETE_BUSY
+                )
+            })
+            .collect();
+        for entry in waiting {
+            if self.store.rectangle_commands_pending()? {
+                break;
+            }
+            if entry.reason == RECTANGLE_DELETE_BUSY {
+                let name = RecordName::parse(&entry.record_name).ok_or_else(|| {
+                    crate::store::sync::RawDataError::Undecodable {
+                        table: "sync_inbox".into(),
+                        reason: "a rectangle deletion has an invalid record name",
+                    }
+                })?;
+                self.apply_deletion(&name)?;
+            } else {
+                let record = remote_from_inbox(&entry).ok_or_else(|| {
+                    crate::store::sync::RawDataError::Undecodable {
+                        table: "sync_inbox".into(),
+                        reason: "a queued rectangle record cannot be decoded",
+                    }
+                })?;
+                self.store.remove_inbox(&entry.record_name)?;
+                self.apply_record(&record)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Records this version could not read when they arrived (a kind it did not know, a schema
     /// newer than it) are looked at again: an update may have taught it to read them. Whatever it
     /// still cannot read stays where it is, untouched.

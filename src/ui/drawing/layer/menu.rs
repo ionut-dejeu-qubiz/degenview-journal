@@ -71,6 +71,8 @@ pub(super) enum Action {
     EditText,
     /// A price alert at a horizontal line's price.
     Alert,
+    /// A time-boxed alert copied from an ordinary rectangle.
+    RectangleAlert,
     Copy,
     Duplicate,
     CopyStyle,
@@ -258,6 +260,23 @@ impl DrawingLayer {
                                     .clicked()
                                 {
                                     action = Some(Action::Alert);
+                                }
+                                if frame.rectangle_alerts_available
+                                    && ui.available_width() >= 26.0
+                                    && matches!(
+                                        drawing.geometry(),
+                                        Some(Geometry::Rectangle { .. })
+                                    )
+                                    && icons::button(
+                                        ui,
+                                        Icon::Bell,
+                                        26.0,
+                                        theme::text_primary(),
+                                        "Create rectangle alert",
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(Action::RectangleAlert);
                                 }
                                 if icons::button(
                                     ui,
@@ -571,6 +590,20 @@ impl DrawingLayer {
                     !drawing.locked(),
                     false,
                     Action::Alert,
+                );
+            }
+            if frame.rectangle_alerts_available
+                && let Some(drawing) = first
+                    .filter(|d| single && matches!(d.geometry(), Some(Geometry::Rectangle { .. })))
+            {
+                item(
+                    ui,
+                    Icon::Bell,
+                    "Create rectangle alert",
+                    None,
+                    !drawing.locked(),
+                    false,
+                    Action::RectangleAlert,
                 );
             }
             if matches!(
@@ -917,6 +950,13 @@ impl DrawingLayer {
             Action::Alert => {
                 if let [drawing] = &targets[..] {
                     frame.alert_price = drawing.anchors().first().map(|anchor| anchor.price);
+                }
+            }
+            Action::RectangleAlert => {
+                if let [drawing] = &targets[..]
+                    && let Some(Geometry::Rectangle { a, b }) = drawing.geometry()
+                {
+                    frame.rectangle_alert_bounds = Some((*a, *b));
                 }
             }
             Action::Copy => {

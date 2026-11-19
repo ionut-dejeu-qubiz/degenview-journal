@@ -264,6 +264,8 @@ impl<T: SyncTransport> SyncCore<T> {
                     super::apply::NEWER_SCHEMA,
                     super::apply::LOCAL_UNREADABLE,
                     super::apply::DELETE_PENDING,
+                    super::apply::RECTANGLE_BUSY,
+                    super::apply::RECTANGLE_DELETE_BUSY,
                 ])
                 .is_ok_and(|waiting| waiting > 0)
         {
@@ -348,6 +350,33 @@ impl<T: SyncTransport> SyncCore<T> {
 
     /// Periodic housekeeping: retry due entries and pick up local changes.
     pub fn tick(&mut self) {
+        if self.can_upload() && self.unapplied.is_empty() {
+            let ready = {
+                let store = lock(&self.store);
+                store.rectangle_commands_pending().and_then(|pending| {
+                    if pending {
+                        Ok(false)
+                    } else {
+                        store.rectangle_sync_waiting()
+                    }
+                })
+            };
+            match ready {
+                Ok(true) => {
+                    self.clear_store_error("check rectangle alert queue");
+                    let id = self.next_batch;
+                    self.next_batch += 1;
+                    self.unapplied.insert(id);
+                    self.effects.push(Effect::RemoteChanges(RemoteBatch {
+                        id,
+                        records: Vec::new(),
+                        deletions: Vec::new(),
+                    }));
+                }
+                Ok(false) => self.clear_store_error("check rectangle alert queue"),
+                Err(error) => self.note_store_error("check rectangle alert queue", &error),
+            }
+        }
         if self.reconcile_needed && self.can_sync() {
             self.reconcile_needed = false;
             let result = lock(&self.store).reconcile_stored();
@@ -519,10 +548,29 @@ impl<T: SyncTransport> SyncCore<T> {
         let (meta, load) = {
             let store = lock(&self.store);
             (
-                store.entity_meta(row.kind, &row.sync_id).ok().flatten(),
-                store.load_projected(row.kind, &row.sync_id).ok(),
+                store.entity_meta(row.kind, &row.sync_id),
+                store.load_projected(row.kind, &row.sync_id),
             )
         };
+        let (meta, load) = if row.kind == EntityKind::RectangleAlert {
+            match (meta, load) {
+                (Ok(meta), Ok(load)) => {
+                    self.clear_store_error("read rectangle alerts");
+                    (meta, Some(load))
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    self.note_store_error("read rectangle alerts", &error);
+                    return None;
+                }
+            }
+        } else {
+            (meta.ok().flatten(), load.ok())
+        };
+        if row.kind == EntityKind::RectangleAlert
+            && !matches!(&load, Some(Load::Found(_) | Load::Gone))
+        {
+            return None;
+        }
         let system_fields = meta.as_ref().and_then(|m| m.system_fields.clone());
         match row.op {
             OutboxOp::Delete => Some((
@@ -548,6 +596,7 @@ impl<T: SyncTransport> SyncCore<T> {
                         .scripts
                         .as_ref()
                         .and_then(|cache| cache.lock().ok()?.get(&row.sync_id).cloned())?,
+                    Load::Deferred => return None,
                 };
                 // Over one record as written is deflated; over it even then is blocked.
                 let Some(wire) = to_wire(&entity.payload) else {

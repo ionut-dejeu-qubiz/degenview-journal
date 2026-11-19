@@ -12,8 +12,20 @@ use crate::model::alert::AlertTriggerEvent;
 pub const DEFAULT_PRICE_ALERT_TEMPLATE: &str = "{{ticker}} alert: {{close}}";
 
 /// Every placeholder the renderer can resolve; documentation and the editors read this.
-pub const SUPPORTED_PLACEHOLDERS: [&str; 10] = [
-    "ticker", "exchange", "open", "high", "low", "close", "volume", "time", "timenow", "interval",
+pub const SUPPORTED_PLACEHOLDERS: [&str; 13] = [
+    "ticker",
+    "exchange",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "time",
+    "timenow",
+    "interval",
+    "price",
+    "zone_low",
+    "zone_high",
 ];
 
 /// Values known when an alert triggers. Anything the trigger did not carry stays `None`,
@@ -31,6 +43,9 @@ pub struct AlertMessageContext {
     pub volume: Option<f64>,
     /// Bar open time, epoch ms.
     pub time_ms: Option<i64>,
+    pub price: Option<f64>,
+    pub zone_low: Option<f64>,
+    pub zone_high: Option<f64>,
     /// When the message is rendered, epoch ms.
     pub now_ms: i64,
 }
@@ -69,6 +84,9 @@ fn value(name: &str, context: &AlertMessageContext) -> Option<String> {
         "volume" => context.volume.map(number),
         "time" => context.time_ms.map(timestamp),
         "timenow" => Some(timestamp(context.now_ms)),
+        "price" => context.price.map(number),
+        "zone_low" => context.zone_low.map(number),
+        "zone_high" => context.zone_high.map(number),
         _ => None,
     }
 }
@@ -157,6 +175,9 @@ pub fn context_for_event(event: &AlertTriggerEvent, now_ms: i64) -> AlertMessage
         close: candle.map(|candle| candle.close),
         volume: candle.map(|candle| candle.volume),
         time_ms: candle.map(|candle| candle.open_time_ms),
+        price: Some(event.observed_value),
+        zone_low: None,
+        zone_high: None,
         now_ms,
     }
 }
@@ -185,6 +206,9 @@ mod tests {
             close: Some(100_500.25),
             volume: Some(12.0),
             time_ms: Some(BAR),
+            price: Some(100_500.25),
+            zone_low: Some(100_000.0),
+            zone_high: Some(101_000.0),
             now_ms: BAR + 60_000,
         }
     }
@@ -200,6 +224,8 @@ mod tests {
             render(&all, &context()),
             "ticker=BTCUSDT;exchange=Binance;open=100000.5;high=101000;low=0.00000278;\
              close=100500.25;volume=12;time=2024-05-01T13:45:30Z;timenow=2024-05-01T13:46:30Z;interval=60"
+                .to_owned()
+                + ";price=100500.25;zone_low=100000;zone_high=101000",
         );
         assert_eq!(
             render(DEFAULT_PRICE_ALERT_TEMPLATE, &context()),

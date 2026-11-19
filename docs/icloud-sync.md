@@ -35,6 +35,7 @@ against SQLite, and every sync problem leaves the app fully usable.
 | Chart / drawing templates, custom editor themes | one each | built-in presets and themes live in code; editor themes follow the Templates switch ([Editor themes](editor-themes.md)) |
 | Pine scripts | one per script, content inline | no drafts, no revisions; unmodified bundled examples are skipped |
 | Price alert definitions | one per alert | arrive **switched off** on other Macs, see below |
+| Rectangle-alert definitions | one `rectanglealert` record per alert | storage/sync foundation only; the tool and evaluation are not implemented |
 | Portfolios | one per portfolio, and one per transaction | valuation history is not synced; it is rebuilt on each Mac |
 | Paper trading | one record per account holding the account, its orders, fills, positions, events, closed trades and journal, and which Mac runs it | see [Portfolios and paper trading](#portfolios-and-paper-trading) |
 | Preferences | `appTheme`, `drawing.defaults`, `drawing.prefs`, `snapshot.prefs` (which provider is on, each provider's non-secret settings merged per provider, scale, include-trading only), `editor.prefs` (which editor theme, the editor font, size and line height) | |
@@ -42,6 +43,7 @@ against SQLite, and every sync problem leaves the app fully usable.
 Never synced: market and icon caches, portfolio valuation history, which paper account or
 portfolio is selected, live paper quotes, webhook endpoints and their Keychain secrets, API keys, **live trading** (broker credentials, orders sent and not yet confirmed, and how to trade: a Mac must never act on another Mac's live orders, and a trading credential never leaves the Mac it was entered on), MCP clients/tokens/port and the MCP activity log, Pine alert subscriptions
 (they bind device-local chart ids), the open tabs and windows, alert runtime state and history,
+rectangle-alert checkpoints and trigger history (`rectangle_alert_checkpoint`, `rectangle_alert_event`),
 snapshot consent and the snapshot providers' API keys and tokens, and `content.prefs` (whether a Post card may fetch a preview from X). Every document table and `setting` key is classified in
 `src/sync/record/policy.rs`, and a test fails when one is added without a decision; unclassified means
 local.
@@ -182,6 +184,7 @@ stays safe. (Read from the code; it has not been tried between two real builds.)
 | A new field on an existing tool, marked `"since": N` above the older build's `DRAWING_FORMAT` | The same: kept whole as `Unreadable`, never re-saved without the field. |
 | A new field on an existing tool **without** the marker | The older build decodes the drawing, ignores the field and re-saves it without it, and the stripped copy syncs back over the newer one. Not allowed: see the rule below. |
 | A new record kind (as pictures were), or a higher `SCHEMA_VERSION` | Kept in the inbox, applied by the first launch that reads it (see above). |
+| A rectangle-alert definition (`rectanglealert` record) | A build predating that record kind keeps it in the inbox as `unknown_type`; it does not rewrite it as a price alert. Mixed-version devices have not been tested. |
 | A new tool or magnet value in `drawing.prefs` | That one option falls back to its default; the others are kept. (The fallback is then what this build saves.) |
 | A default style (`drawing.defaults`) or a template for a new tool | **Not read at all**: both are read whole, so one entry for a tool this build lacks leaves them unreadable. The build then refuses to change defaults or templates ("Default styles could not be read ...") and leaves them as written. Drawings are unaffected. Every new tool has this effect, once a default or a template is saved for it. |
 

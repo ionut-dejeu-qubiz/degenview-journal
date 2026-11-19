@@ -6,4 +6,5 @@ pub mod center;
 pub mod editor;
 pub(in crate::ui) mod lines;
 pub mod pine_editor;
+pub mod rectangle_editor;
 pub mod script_list;

@@ -82,6 +82,8 @@ pub enum WorkspaceAction {
         alert: Box<PriceAlert>,
         baseline: Option<f64>,
     },
+    /// A copied chart rectangle was reviewed and saved as an independent live-touch alert.
+    SaveRectangleAlert(Box<crate::model::alert::rectangle::RectangleAlert>),
     /// The price-alert sheet's "Add in Settings".
     OpenWebhookSettings,
     /// Open Settings on the Alpaca page (the symbol picker's "Stocks need an Alpaca key" notice).

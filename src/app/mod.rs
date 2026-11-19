@@ -85,6 +85,8 @@ enum AppAction {
         alert: Box<crate::model::alert::PriceAlert>,
         baseline: Option<f64>,
     },
+    /// The rectangle-alert sheet's Create: queue an independent time-boxed definition.
+    SaveRectangleAlert(Box<crate::model::alert::rectangle::RectangleAlert>),
     /// The price-alert sheet's "Add in Settings".
     OpenWebhookSettings,
     /// A chart's alert line was paused or resumed.
@@ -285,7 +287,16 @@ impl DegenViewApp {
         };
         let actions = Arc::new(Mutex::new(Vec::new()));
         let notifier = macos_notifications::default_notifier();
-        let alerts = AlertCoordinator::new(alert_host, Arc::clone(&notifier), fx_rates);
+        let has_rectangle_alerts = lock(&store)
+            .documents_strict::<crate::model::alert::rectangle::RectangleAlert>("rectangle_alert")
+            .map(|alerts| !alerts.is_empty())
+            .unwrap_or(true);
+        let alerts = AlertCoordinator::new(
+            alert_host,
+            Arc::clone(&notifier),
+            fx_rates,
+            has_rectangle_alerts,
+        );
 
         let (saved_tabs, saved_next_id) = {
             let store = lock(&store);

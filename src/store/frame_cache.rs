@@ -9,6 +9,7 @@
 
 use super::Store;
 use crate::model::alert::pine::PineAlertSubscription;
+use crate::model::alert::rectangle::{RectangleAlert, RectangleCheckpoint, RectangleLiveEvent};
 use crate::model::webhook::WebhookEndpoint;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -98,6 +99,12 @@ pub(crate) struct FrameCaches {
     webhook_endpoints: ChangeCached<Vec<WebhookEndpoint>>,
     /// The Alerts window's "not evaluated here" marks.
     muted_alerts: ChangeCached<HashSet<u64>>,
+    /// Rectangle definitions and local checkpoints, for the chart overlays and Alerts window.
+    rectangle_alerts: ChangeCached<Result<Vec<RectangleAlert>, String>>,
+    rectangle_checkpoints: ChangeCached<Result<Vec<RectangleCheckpoint>, String>>,
+    rectangle_muted_alerts: ChangeCached<Result<HashSet<u64>, String>>,
+    /// Recent rectangle events shown in-app; payloads are decoded only after a database change.
+    rectangle_events: ChangeCached<Result<Vec<RectangleLiveEvent>, String>>,
     /// `(delivered, attempted)` per alert event, for the Alerts window's history chips.
     webhook_summaries: ChangeCachedMap<u64, Option<(usize, usize)>>,
 }
@@ -136,6 +143,65 @@ impl Store {
         self.frame_caches
             .muted_alerts
             .get(self.change_stamp(), || self.muted_alerts())
+    }
+
+    pub fn rectangle_alerts_cached(&self) -> Result<Arc<Vec<RectangleAlert>>, String> {
+        let cached = self
+            .frame_caches
+            .rectangle_alerts
+            .get(self.change_stamp(), || {
+                self.rectangle_alerts_for_ui()
+                    .map_err(|error| error.to_string())
+            });
+        cached.as_ref().clone().map(Arc::new)
+    }
+
+    pub fn rectangle_checkpoints_cached(&self) -> Result<Arc<Vec<RectangleCheckpoint>>, String> {
+        let cached = self
+            .frame_caches
+            .rectangle_checkpoints
+            .get(self.change_stamp(), || {
+                self.rectangle_checkpoints_for_ui()
+                    .map_err(|error| error.to_string())
+            });
+        cached.as_ref().clone().map(Arc::new)
+    }
+
+    pub fn muted_rectangle_alerts_cached(&self) -> Result<Arc<HashSet<u64>>, String> {
+        let cached = self
+            .frame_caches
+            .rectangle_muted_alerts
+            .get(self.change_stamp(), || {
+                self.muted_rectangle_alerts()
+                    .map_err(|error| error.to_string())
+            });
+        cached.as_ref().clone().map(Arc::new)
+    }
+
+    pub fn recent_rectangle_events_cached(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<RectangleLiveEvent>, String> {
+        let cached = self
+            .frame_caches
+            .rectangle_events
+            .get(self.change_stamp(), || {
+                self.rectangle_event_history()
+                    .map_err(|error| error.to_string())
+            });
+        match cached.as_ref() {
+            Ok(events) => {
+                let cutoff_ms = now_ms.saturating_sub(60_000);
+                Ok(events
+                    .iter()
+                    .filter(|event| {
+                        event.detected_at_ms >= cutoff_ms && event.detected_at_ms <= now_ms
+                    })
+                    .cloned()
+                    .collect())
+            }
+            Err(error) => Err(error.clone()),
+        }
     }
 
     /// How many of `event_id`'s webhook deliveries arrived, of how many were attempted; `None`

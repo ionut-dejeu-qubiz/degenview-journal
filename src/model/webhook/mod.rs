@@ -174,6 +174,7 @@ impl WebhookDeliveryError {
 pub enum WebhookDeliverySource {
     Price,
     Pine,
+    Rectangle,
     Test,
 }
 
@@ -183,6 +184,7 @@ impl WebhookDeliverySource {
         match self {
             Self::Price => "price",
             Self::Pine => "pine",
+            Self::Rectangle => "rectangle",
             Self::Test => "test",
         }
     }
@@ -191,6 +193,7 @@ impl WebhookDeliverySource {
         match value {
             "price" => Some(Self::Price),
             "pine" => Some(Self::Pine),
+            "rectangle" => Some(Self::Rectangle),
             "test" => Some(Self::Test),
             _ => None,
         }
@@ -317,6 +320,15 @@ mod tests {
         assert!(WebhookHeader::new("  ", " ").is_blank());
         assert!(!WebhookHeader::new("X", "").is_blank());
         assert!(!WebhookHeader::new("", "v").is_blank());
+    }
+
+    #[test]
+    fn rectangle_is_a_stable_delivery_source() {
+        assert_eq!(WebhookDeliverySource::Rectangle.as_str(), "rectangle");
+        assert_eq!(
+            WebhookDeliverySource::from_str("rectangle"),
+            Some(WebhookDeliverySource::Rectangle)
+        );
     }
 
     #[test]

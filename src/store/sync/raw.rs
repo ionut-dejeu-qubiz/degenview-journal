@@ -34,6 +34,9 @@ pub fn row_decodes(table: &str, payload: &str) -> bool {
         }
         "editor_theme" => serde_json::from_str::<model::editor_theme::EditorTheme>(payload).is_ok(),
         "price_alert" => serde_json::from_str::<model::alert::PriceAlert>(payload).is_ok(),
+        "rectangle_alert" => {
+            serde_json::from_str::<model::alert::rectangle::RectangleAlert>(payload).is_ok()
+        }
         "portfolio" => serde_json::from_str::<model::portfolio::Portfolio>(payload).is_ok(),
         "portfolio_transaction" => {
             serde_json::from_str::<model::portfolio::PortfolioTransaction>(payload).is_ok()

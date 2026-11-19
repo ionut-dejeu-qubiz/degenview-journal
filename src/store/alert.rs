@@ -192,6 +192,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rewrite_preserves_an_unknown_condition_payload() {
+        let store = Store::open_in_memory().expect("open");
+        let payload = serde_json::json!({
+            "tag": "rectangle",
+            "start_ms": 1000,
+            "end_ms": 2000,
+            "bounds": {"low": 10, "high": 20}
+        });
+        let mut future = alert(7);
+        future.condition = serde_json::from_value(payload.clone()).expect("condition");
+        let snapshot = AlertPersistenceSnapshot {
+            revision: 1,
+            alerts: vec![future],
+            ..Default::default()
+        };
+        store
+            .save_alert_snapshot_and_acknowledge(&snapshot, &[])
+            .expect("save");
+        let loaded = store
+            .load_alert_snapshot()
+            .expect("load")
+            .expect("snapshot");
+        store
+            .save_alert_snapshot_and_acknowledge(&loaded, &[])
+            .expect("rewrite");
+        let rewritten = store
+            .load_alert_snapshot()
+            .expect("load")
+            .expect("snapshot");
+        assert_eq!(
+            serde_json::to_value(&rewritten.alerts[0].condition).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
     fn commands_are_acknowledged_only_with_a_saved_snapshot() {
         let store = Store::open_in_memory().expect("open");
         let command = AlertRuntimeCommand::new(AlertRuntimeCommandPayload::Delete(9), 1_000);

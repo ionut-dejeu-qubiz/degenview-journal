@@ -5,6 +5,7 @@
 use crate::host::alert::runtime::{AlertRuntimeLease, GuiRuntimeDecision, gui_runtime_decision};
 use crate::host::mcp::alert::SaveAlert;
 use crate::lock::lock;
+use crate::model::alert::rectangle::{RectangleAlert, RectangleCommand, RectangleCommandPayload};
 use crate::model::alert::{
     AlertPrecondition, AlertRuntimeCommand, AlertRuntimeCommandPayload, AlertRuntimeHealth,
     AlertServiceState, PriceAlert,
@@ -63,8 +64,8 @@ impl AlertRuntimeControl {
 /// Who runs the alert runtime this frame, as [`AlertRegistration::decide`] found it.
 pub(super) struct RuntimeTurn {
     pub(super) decision: GuiRuntimeDecision,
-    /// This app holds the runtime lease.
-    pub(super) owns_lease: bool,
+    /// Kept by any work started on this turn until that work finishes.
+    pub(super) lease: Option<AlertRuntimeLease>,
     pub(super) service_state: AlertServiceState,
 }
 
@@ -147,6 +148,30 @@ impl AlertRegistration {
         Ok(save.id)
     }
 
+    /// Queues a rectangle definition and ensures the shared background evaluator is registered.
+    pub(in crate::app) fn commit_rectangle(
+        &self,
+        store: &Store,
+        alert: Box<RectangleAlert>,
+        now: i64,
+    ) -> rusqlite::Result<u64> {
+        let command = RectangleCommand::new(RectangleCommandPayload::Save(alert), now);
+        store.enqueue_rectangle_command(&command)?;
+        let notifier = Arc::clone(&self.notifier);
+        std::thread::spawn(move || {
+            let _ = notifier.request_authorization();
+        });
+        let service_state = self
+            .background_service
+            .lock()
+            .map(|mut service| service.ensure_registered())
+            .unwrap_or(AlertServiceState::Failed);
+        if let Ok(mut control) = self.runtime_control.lock() {
+            control.retrying(service_state, now);
+        }
+        Ok(command.id)
+    }
+
     /// Settings ▸ Alerts' Retry: registers the background service again.
     pub(in crate::app) fn retry(&self, now: i64) {
         if let Ok(mut control) = self.runtime_control.lock() {
@@ -196,7 +221,7 @@ impl AlertRegistration {
         }
         RuntimeTurn {
             decision,
-            owns_lease: control.lease.is_some(),
+            lease: control.lease.clone(),
             service_state: control.service_state,
         }
     }

@@ -1,5 +1,5 @@
 //! Native user-notification delivery. Bundled macOS builds use `UNUserNotificationCenter`;
-//! tests, unbundled development binaries and other platforms use a no-op implementation.
+//! Windows uses app-identified toast notifications. Tests alone use a no-op implementation.
 
 use crate::model::alert::AlertNotificationPermission;
 use crate::model::alert::notification::NotificationContent;
@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const SOUND_NAME: &str = "Glass";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_APP_USER_MODEL_ID: &str = crate::platform::APPLICATION_ID;
 
 pub fn is_disabled() -> bool {
     cfg!(test)
@@ -34,11 +37,67 @@ impl Notifier for NullNotifier {
     }
 }
 
+fn escape_xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if !(character == '\t'
+            || character == '\n'
+            || character == '\r'
+            || ('\u{20}'..='\u{D7FF}').contains(&character)
+            || ('\u{E000}'..='\u{FFFD}').contains(&character)
+            || ('\u{10000}'..='\u{10FFFF}').contains(&character))
+        {
+            continue;
+        }
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 pub fn default_notifier() -> Arc<dyn Notifier> {
-    if is_disabled() || !platform::is_bundled() {
-        Arc::new(NullNotifier)
-    } else {
-        Arc::new(platform::NativeNotifier::new())
+    if cfg!(test) {
+        return Arc::new(NullNotifier);
+    }
+    if is_disabled() {
+        return Arc::new(UnavailableNotifier(
+            "System notifications are disabled by the environment.".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if platform::is_bundled() {
+            Arc::new(platform::NativeNotifier::new())
+        } else {
+            Arc::new(UnavailableNotifier(
+                "System notifications require an installed DegenView application bundle."
+                    .to_owned(),
+            ))
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(platform_windows::NativeNotifier::default())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Arc::new(UnavailableNotifier(
+            "System notifications are not supported on this platform.".to_owned(),
+        ))
+    }
+}
+
+struct UnavailableNotifier(String);
+
+impl Notifier for UnavailableNotifier {
+    fn deliver(&self, _: &NotificationContent) -> Result<(), String> {
+        Err(self.0.clone())
     }
 }
 
@@ -250,25 +309,115 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod platform {
+#[cfg(target_os = "windows")]
+mod platform_windows {
     use super::*;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{
+        NotificationSetting, ToastNotification, ToastNotificationManager,
+    };
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+    use windows::core::HSTRING;
 
-    pub fn is_bundled() -> bool {
-        false
+    struct WinRtApartment {
+        initialized: bool,
     }
 
-    pub struct NativeNotifier;
-
-    impl NativeNotifier {
-        pub fn new() -> Self {
-            Self
+    impl WinRtApartment {
+        fn initialize() -> Result<Self, String> {
+            // A desktop windowing library may already have initialized this thread as STA.
+            match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                Ok(()) => Ok(Self { initialized: true }),
+                Err(error) if error.code().0 == 0x80010106u32 as i32 => {
+                    Ok(Self { initialized: false })
+                }
+                Err(error) => Err(format!("Windows Runtime could not be initialized: {error}")),
+            }
         }
     }
 
+    impl Drop for WinRtApartment {
+        fn drop(&mut self) {
+            if self.initialized {
+                unsafe { RoUninitialize() };
+            }
+        }
+    }
+
+    fn notifier() -> Result<windows::UI::Notifications::ToastNotifier, String> {
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+            WINDOWS_APP_USER_MODEL_ID,
+        ))
+        .map_err(|error| format!("Windows notifications are unavailable: {error}"))
+    }
+
+    fn permission(setting: NotificationSetting) -> AlertNotificationPermission {
+        if setting == NotificationSetting::Enabled {
+            AlertNotificationPermission::Authorized
+        } else {
+            AlertNotificationPermission::Denied
+        }
+    }
+
+    #[derive(Default)]
+    pub struct NativeNotifier {
+        permission: std::sync::Mutex<AlertNotificationPermission>,
+    }
+
     impl Notifier for NativeNotifier {
-        fn deliver(&self, _: &NotificationContent) -> Result<(), String> {
-            Ok(())
+        fn deliver(&self, value: &NotificationContent) -> Result<(), String> {
+            let _apartment = WinRtApartment::initialize()?;
+            let notifier = notifier()?;
+            let setting = notifier.Setting().map_err(|error| {
+                format!("Windows notification settings could not be read: {error}")
+            })?;
+            if let Ok(mut cached) = self.permission.lock() {
+                *cached = permission(setting);
+            }
+            if setting != NotificationSetting::Enabled {
+                return Err(
+                    "Windows notifications are disabled for DegenView or this user.".to_owned(),
+                );
+            }
+
+            let audio = if value.sound {
+                "<audio src=\"ms-winsoundevent:Notification.Default\"/>"
+            } else {
+                ""
+            };
+            let xml = format!(
+                "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual>{audio}</toast>",
+                escape_xml(&value.title),
+                escape_xml(&value.body)
+            );
+            let document = XmlDocument::new().map_err(|error| {
+                format!("Windows notification XML could not be created: {error}")
+            })?;
+            document
+                .LoadXml(&HSTRING::from(xml))
+                .map_err(|error| format!("Windows notification XML was rejected: {error}"))?;
+            let toast = ToastNotification::CreateToastNotification(&document)
+                .map_err(|error| format!("Windows notification could not be created: {error}"))?;
+            let identifier = value
+                .identifier
+                .parse::<u64>()
+                .map_err(|error| format!("Invalid notification identifier: {error}"))?;
+            toast
+                .SetTag(&HSTRING::from(format!("{identifier:016x}")))
+                .map_err(|error| format!("Windows notification tag could not be set: {error}"))?;
+            toast
+                .SetGroup(&HSTRING::from("degenview-alerts"))
+                .map_err(|error| format!("Windows notification group could not be set: {error}"))?;
+            notifier
+                .Show(&toast)
+                .map_err(|error| format!("Windows could not display the notification: {error}"))
+        }
+
+        fn permission(&self) -> AlertNotificationPermission {
+            self.permission
+                .lock()
+                .map(|permission| *permission)
+                .unwrap_or(AlertNotificationPermission::Unknown)
         }
     }
 }
@@ -331,5 +480,20 @@ mod tests {
         assert!(content(true).sound);
         assert!(!content(false).sound);
         assert_eq!(SOUND_NAME, "Glass");
+    }
+
+    #[test]
+    fn xml_text_is_escaped_and_invalid_controls_are_removed() {
+        assert_eq!(
+            escape_xml("<A&B \"price\">\u{1}"),
+            "&lt;A&amp;B &quot;price&quot;&gt;"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_toast_identity_matches_the_installer_shortcut() {
+        let installer = include_str!("../../../packaging/windows/degenview.iss");
+        assert!(installer.contains(&format!("AppUserModelID: \"{WINDOWS_APP_USER_MODEL_ID}\"")));
     }
 }

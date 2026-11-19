@@ -92,6 +92,13 @@ pub(super) fn show_tab(
                 workspace.set_unseen_alerts(host.unseen().count());
                 workspace.set_price_alerts(&host.snapshot().alerts);
             }
+            if let Err(error) = workspace.refresh_rectangle_alerts()
+                && let Ok(mut host) = env.alert_host.lock()
+            {
+                host.set_rectangle_error(Some(format!(
+                    "Rectangle alerts could not be read: {error}"
+                )));
+            }
             env.alert_fx
                 .with(|rates| workspace.set_alert_fx_rates(rates));
             workspace.set_card_env(&env.card_env);
@@ -113,6 +120,9 @@ pub(super) fn show_tab(
                     WorkspaceAction::OpenAlerts => AppAction::OpenAlerts,
                     WorkspaceAction::SavePriceAlert { alert, baseline } => {
                         AppAction::SavePriceAlert { alert, baseline }
+                    }
+                    WorkspaceAction::SaveRectangleAlert(alert) => {
+                        AppAction::SaveRectangleAlert(alert)
                     }
                     WorkspaceAction::OpenWebhookSettings => AppAction::OpenWebhookSettings,
                     WorkspaceAction::OpenWatchlistInNewTab(item) => {

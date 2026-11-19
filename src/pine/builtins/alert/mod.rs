@@ -137,6 +137,9 @@ fn message_context(
         close: Some(bar.close),
         volume: Some(bar.volume),
         time_ms: Some(bar.open_time),
+        price: Some(bar.close),
+        zone_low: None,
+        zone_high: None,
         now_ms: if flags.is_realtime {
             now_millis()
         } else {

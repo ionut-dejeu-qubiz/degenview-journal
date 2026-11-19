@@ -315,7 +315,7 @@ fn an_alert_with_a_condition_from_a_newer_version_cannot_be_toggled() {
             "Bitcoin",
         ),
         AlertCondition::Unsupported {
-            tag: "touchesVwap".into(),
+            payload: serde_json::json!({"tag": "touchesVwap"}),
         },
         NOW,
     );
@@ -624,7 +624,13 @@ fn edits_keep_webhooks_and_refuse_what_cannot_be_edited() {
     );
 
     // A condition from a newer version, and an alert that does not exist.
-    let future = PriceAlert::new(asset, AlertCondition::Unsupported { tag: "x".into() }, NOW);
+    let future = PriceAlert::new(
+        asset,
+        AlertCondition::Unsupported {
+            payload: serde_json::json!({"tag": "x"}),
+        },
+        NOW,
+    );
     let future_id = future.id;
     command(
         &store,

@@ -227,6 +227,9 @@ pub static LINKS: WorkQueue = WorkQueue::new(1);
 /// minutes and must never hold one of the general workers that fetch candles and alert quotes.
 pub static UPDATES: WorkQueue = WorkQueue::new(1);
 
+/// Alert runtime persistence cannot wait behind slow market-data or UI jobs.
+pub static ALERTS: WorkQueue = WorkQueue::new(1);
+
 /// Chart snapshots, file dialogs and tests that read a saved key wait on things that take as long
 /// as the user or the network does (a save panel, a Keychain prompt, an upload), so they never
 /// borrow a general worker.

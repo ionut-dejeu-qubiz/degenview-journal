@@ -258,7 +258,7 @@ impl NotificationSwitch {
         Self::MacosNotifications,
     ];
 
-    /// The switches this platform can honour: macOS Notifications exists only on macOS.
+    /// The switches this platform can honour.
     pub fn available() -> impl Iterator<Item = Self> {
         Self::ALL.into_iter().filter(|switch| {
             *switch != Self::MacosNotifications || platform::has_system_notifications()
@@ -270,7 +270,7 @@ impl NotificationSwitch {
             Self::Delivery => "Price Alert Delivery",
             Self::Sound => "Sound",
             Self::InAppBanners => "In-App Banners",
-            Self::MacosNotifications => "macOS Notifications",
+            Self::MacosNotifications => "System Notifications",
         }
     }
 
@@ -281,8 +281,11 @@ impl NotificationSwitch {
             }
             Self::Sound => "Play an alert sound when a notification is delivered.",
             Self::InAppBanners => "Show alerts inside DegenView while the app is open.",
+            Self::MacosNotifications if cfg!(target_os = "windows") => {
+                "Send alerts through Windows notifications while DegenView is running."
+            }
             Self::MacosNotifications => {
-                "Send alerts through Notification Center, including in the background."
+                "Send alerts through the operating system, including in the background."
             }
         }
     }
@@ -707,7 +710,7 @@ impl NotificationSwitch {
             Self::Delivery => Icon::BellBadge,
             Self::Sound => Icon::SpeakerWave,
             Self::InAppBanners => Icon::RectTop,
-            Self::MacosNotifications => Icon::MacWindow,
+            Self::MacosNotifications => Icon::Bell,
         }
     }
 }
@@ -735,8 +738,27 @@ fn notifications_page(ui: &mut egui::Ui, input: &SettingsInput, actions: &mut Ve
         }
     });
 
-    // The background agent, Login Items and the permission prompt are macOS services.
     if !platform::has_system_notifications() {
+        return;
+    }
+    if !platform::has_background_alert_agent() {
+        section(
+            ui,
+            "System notifications",
+            Some("Windows notifications are sent while DegenView is running."),
+            |ui| {
+                let health = input.health;
+                card(ui, |ui| {
+                    row(ui, "Notification permission", |ui| {
+                        kit::status_badge(
+                            ui,
+                            permission_label(health.notification_permission),
+                            permission_tone(health.notification_permission),
+                        );
+                    });
+                });
+            },
+        );
         return;
     }
     section(
@@ -1070,7 +1092,7 @@ mod tests {
         assert!(NotificationSwitch::Delivery.hint().contains("armed alerts"));
         assert_eq!(
             NotificationSwitch::MacosNotifications.title(),
-            "macOS Notifications"
+            "System Notifications"
         );
     }
 }

@@ -80,6 +80,7 @@ pub enum EntityKind {
     EditorTheme,
     Script,
     Alert,
+    RectangleAlert,
     Portfolio,
     PortfolioTransaction,
     /// One paper account with everything that belongs to it, as a single record.
@@ -88,7 +89,7 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    pub const ALL: [EntityKind; 13] = [
+    pub const ALL: [EntityKind; 14] = [
         Self::Layout,
         Self::LayoutDrawing,
         Self::DrawingAsset,
@@ -98,6 +99,7 @@ impl EntityKind {
         Self::EditorTheme,
         Self::Script,
         Self::Alert,
+        Self::RectangleAlert,
         Self::Portfolio,
         Self::PortfolioTransaction,
         Self::PaperAccount,
@@ -115,6 +117,7 @@ impl EntityKind {
             Self::EditorTheme => "editor_theme",
             Self::Script => "script",
             Self::Alert => "alert",
+            Self::RectangleAlert => "rectanglealert",
             Self::Portfolio => "portfolio",
             Self::PortfolioTransaction => "portfoliotx",
             Self::PaperAccount => "paperaccount",
@@ -132,7 +135,7 @@ impl EntityKind {
             Self::Watchlist => Category::Watchlists,
             Self::ChartTemplate | Self::DrawingTemplate | Self::EditorTheme => Category::Templates,
             Self::Script => Category::Scripts,
-            Self::Alert => Category::Alerts,
+            Self::Alert | Self::RectangleAlert => Category::Alerts,
             Self::Portfolio | Self::PortfolioTransaction => Category::Portfolios,
             Self::PaperAccount => Category::PaperTrading,
             Self::Setting => Category::Preferences,
@@ -149,6 +152,7 @@ impl EntityKind {
             | Self::DrawingTemplate
             | Self::EditorTheme
             | Self::Alert
+            | Self::RectangleAlert
             | Self::Portfolio
             | Self::PortfolioTransaction
             | Self::Setting => Merge::LastWriterWins,
@@ -191,6 +195,13 @@ pub fn table_policy(table: &str) -> TablePolicy {
         "drawing_template" => TablePolicy::Synced(EntityKind::DrawingTemplate),
         "editor_theme" => TablePolicy::Synced(EntityKind::EditorTheme),
         "price_alert" => TablePolicy::Synced(EntityKind::Alert),
+        "rectangle_alert" => TablePolicy::Synced(EntityKind::RectangleAlert),
+        "rectangle_alert_checkpoint" => {
+            TablePolicy::Local("rectangle alert evaluation progress belongs to this device")
+        }
+        "rectangle_alert_event" => {
+            TablePolicy::Local("rectangle alert trigger history belongs to this device")
+        }
         "tab" => {
             TablePolicy::Local("per-device session; tab and chart ids are sequential counters")
         }
@@ -298,6 +309,7 @@ mod tests {
                 "watchlist",
                 "portfolio",
                 "price_alert",
+                "rectangle_alert",
                 "drawing_asset"
             ]
         );

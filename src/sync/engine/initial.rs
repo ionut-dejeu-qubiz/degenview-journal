@@ -51,7 +51,7 @@ impl Counts {
                 self.templates += 1
             }
             EntityKind::Script => self.scripts += 1,
-            EntityKind::Alert => self.alerts += 1,
+            EntityKind::Alert | EntityKind::RectangleAlert => self.alerts += 1,
             EntityKind::Portfolio => self.portfolios += 1,
             EntityKind::PaperAccount => self.paper_accounts += 1,
             EntityKind::Setting => self.settings += 1,

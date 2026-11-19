@@ -347,6 +347,9 @@ pub struct ChartCard {
     /// The price alerts to draw as lines (the workspace fills them each frame), and the tag
     /// right-clicked since the last request was read.
     alert_lines: Vec<crate::model::alert::line::AlertLine>,
+    rectangle_alerts: Vec<crate::model::alert::rectangle::RectangleAlert>,
+    rectangle_checkpoints: Vec<crate::model::alert::rectangle::RectangleCheckpoint>,
+    rectangle_muted_alerts: std::collections::HashSet<u64>,
     alert_menu: Option<lines::LineMenu>,
     /// The market the alert tags are dragged on, and the tags dropped on a new level since the
     /// workspace last took them.
@@ -422,6 +425,9 @@ impl Default for ChartCard {
             table_feed: None,
             table_stamp: 0,
             alert_lines: Vec::new(),
+            rectangle_alerts: Vec::new(),
+            rectangle_checkpoints: Vec::new(),
+            rectangle_muted_alerts: std::collections::HashSet::new(),
             alert_menu: None,
             alert_market: lines::Market::default(),
             alert_moves: Vec::new(),
@@ -725,6 +731,7 @@ impl ChartCard {
     }
 }
 
+mod alert_zones;
 mod bar_marker;
 mod body;
 mod context;

@@ -22,6 +22,7 @@ impl Store {
     /// matching the cloud, is left alone.
     pub fn reconcile_stored(&self) -> rusqlite::Result<Reconciled> {
         let mut by_kind: HashMap<EntityKind, HashMap<String, Projected>> = HashMap::new();
+        let rectangle_busy = self.rectangle_commands_pending()?;
         for kind in [
             EntityKind::Layout,
             EntityKind::LayoutDrawing,
@@ -30,12 +31,15 @@ impl Store {
             EntityKind::DrawingTemplate,
             EntityKind::EditorTheme,
             EntityKind::Alert,
+            EntityKind::RectangleAlert,
             EntityKind::Portfolio,
             EntityKind::PortfolioTransaction,
             EntityKind::PaperAccount,
             EntityKind::Setting,
         ] {
-            by_kind.insert(kind, HashMap::new());
+            if kind != EntityKind::RectangleAlert || !rectangle_busy {
+                by_kind.insert(kind, HashMap::new());
+            }
         }
         let ids = self.id_space();
         for entity in self.stored_paper_entities()? {
@@ -45,6 +49,12 @@ impl Store {
                 .insert(entity.sync_id.clone(), entity);
         }
         for table in crate::store::DOCUMENT_TABLES {
+            if table == "rectangle_alert" {
+                if rectangle_busy {
+                    continue;
+                }
+                self.documents_strict::<crate::model::alert::rectangle::RectangleAlert>(table)?;
+            }
             // Pictures are large and immutable: they are looked at by id below, never read whole.
             if !matches!(table_policy(table), TablePolicy::Synced(_))
                 || table == crate::store::asset_store::TABLE

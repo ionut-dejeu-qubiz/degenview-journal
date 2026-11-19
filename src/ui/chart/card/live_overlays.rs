@@ -39,6 +39,14 @@ impl Overlays for LiveOverlays<'_> {
         drawing: &mut DrawingFrame,
         layout: &FrameLayout,
     ) {
+        alert_zones::paint(
+            self.ui.painter(),
+            projection,
+            &self.card.rectangle_alerts,
+            &self.card.rectangle_checkpoints,
+            &self.card.rectangle_muted_alerts,
+            layout.top_inset,
+        );
         if layout.main_visible
             && !self.replay.selecting
             && !self

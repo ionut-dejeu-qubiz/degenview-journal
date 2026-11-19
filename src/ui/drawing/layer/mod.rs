@@ -93,6 +93,8 @@ pub struct DrawingFrame<'a> {
     pub style_clipboard: Option<(Tool, DrawingStyle)>,
     /// A dialog or sheet has the keyboard: Return, Delete and the duplicate shortcut are its.
     pub keys_blocked: bool,
+    /// Rectangle alerts are only available on supported live market charts.
+    pub rectangle_alerts_available: bool,
     /// A drawing shown in place of the stored one with its id: the properties dialog's live
     /// preview of an edit not yet committed.
     pub preview: Option<&'a Drawing>,
@@ -134,6 +136,8 @@ pub struct DrawingFrame<'a> {
     /// The user asked for a price alert at this price (a horizontal line's); the workspace opens
     /// the alert editor for them to review.
     pub alert_price: Option<f64>,
+    /// The bounds of a selected ordinary rectangle, copied for alert creation.
+    pub rectangle_alert_bounds: Option<(Anchor, Anchor)>,
 }
 
 /// What can be asked of a Post card that only the workspace can do.
@@ -162,6 +166,7 @@ impl<'a> DrawingFrame<'a> {
             defaults: None,
             style_clipboard: None,
             keys_blocked: false,
+            rectangle_alerts_available: false,
             preview: None,
             commands: Vec::new(),
             select: None,
@@ -180,6 +185,7 @@ impl<'a> DrawingFrame<'a> {
             copy_image: None,
             link_request: None,
             alert_price: None,
+            rectangle_alert_bounds: None,
         }
     }
 
@@ -212,6 +218,11 @@ impl<'a> DrawingFrame<'a> {
 
     pub fn with_keys_blocked(mut self, blocked: bool) -> Self {
         self.keys_blocked = blocked;
+        self
+    }
+
+    pub fn with_rectangle_alerts_available(mut self, available: bool) -> Self {
+        self.rectangle_alerts_available = available;
         self
     }
 

@@ -46,6 +46,8 @@ pub const NEWER_SCHEMA: &str = "newer_schema";
 pub const LOCAL_UNREADABLE: &str = "local_unreadable";
 /// A deletion kept for the same reason. Its payload is empty; only the name matters.
 pub const DELETE_PENDING: &str = "delete_pending";
+pub const RECTANGLE_BUSY: &str = "rectangle_busy";
+pub const RECTANGLE_DELETE_BUSY: &str = "rectangle_delete_busy";
 
 /// Who is applying, and when. Passed in so applying is deterministic under test.
 #[derive(Debug, Clone)]
@@ -128,6 +130,7 @@ pub fn apply_batch(
         work.retry_orphan_transactions()?;
         work.retry_held_ledgers()?;
         work.retry_busy_scripts()?;
+        work.retry_rectangle_busy()?;
         work.finish_ledgers()?;
         work.flush()?;
         work.flush_ledger_history()?;
@@ -168,6 +171,7 @@ pub fn table_of(kind: EntityKind) -> Option<&'static str> {
         EntityKind::Layout | EntityKind::LayoutDrawing => Some("saved_view"),
         EntityKind::DrawingAsset => Some("drawing_asset"),
         EntityKind::Alert => Some("price_alert"),
+        EntityKind::RectangleAlert => Some("rectangle_alert"),
         EntityKind::Portfolio => Some("portfolio"),
         EntityKind::PortfolioTransaction => Some(portfolio::TRANSACTIONS),
         EntityKind::Setting | EntityKind::Script | EntityKind::PaperAccount => None,
@@ -195,6 +199,9 @@ impl<'a> Work<'a> {
 
     /// Whether every existing row of the table is one this version can read and rewrite.
     fn table_writable(&mut self, table: &'static str) -> Result<bool, SyncError> {
+        if table == "rectangle_alert" && self.store.rectangle_commands_pending()? {
+            return Ok(false);
+        }
         if let Some(known) = self.writable.get(table) {
             return Ok(*known);
         }
@@ -369,6 +376,7 @@ impl<'a> Work<'a> {
             EntityKind::LayoutDrawing => self.apply_drawing(record),
             EntityKind::DrawingAsset => self.apply_asset(record),
             EntityKind::Alert => self.apply_alert(record),
+            EntityKind::RectangleAlert => self.apply_rectangle_alert(record),
             EntityKind::Script => self.apply_script(record),
             EntityKind::PaperAccount => self.apply_paper(record),
         }
@@ -471,7 +479,14 @@ impl<'a> Work<'a> {
                     record_name: name.render(),
                     entity_type: kind.prefix().to_string(),
                     schema_version: crate::sync::record::SCHEMA_VERSION,
-                    reason: DELETE_PENDING.to_string(),
+                    reason: if kind == EntityKind::RectangleAlert
+                        && self.store.rectangle_commands_pending()?
+                    {
+                        RECTANGLE_DELETE_BUSY
+                    } else {
+                        DELETE_PENDING
+                    }
+                    .to_string(),
                     payload: Vec::new(),
                     system_fields: None,
                     revision: 0,
@@ -486,6 +501,9 @@ impl<'a> Work<'a> {
         let meta = self.store.entity_meta(kind, id)?;
         let Some(local) = self.find_local(kind, id)? else {
             self.store.tombstone_entity(kind, id, id, self.ctx.now_ms)?;
+            if kind == EntityKind::RectangleAlert {
+                self.store.remove_alert_local(&format!("rectangle:{id}"))?;
+            }
             return Ok(());
         };
         let edited_since = meta
@@ -515,6 +533,23 @@ impl<'a> Work<'a> {
         self.store
             .tombstone_entity(kind, id, &local.local_id, self.ctx.now_ms)?;
         self.store.cancel_outbox(kind, id)?;
+        if kind == EntityKind::RectangleAlert {
+            let alert_id = local.row.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                crate::store::sync::RawDataError::Undecodable {
+                    table: "rectangle_alert".to_string(),
+                    reason: "a rectangle alert has no valid id",
+                }
+            })?;
+            let command = crate::model::alert::rectangle::RectangleCommand::new(
+                crate::model::alert::rectangle::RectangleCommandPayload::Delete(alert_id),
+                self.ctx.now_ms,
+            );
+            self.store.enqueue_rectangle_command(&command)?;
+            self.store.remove_alert_local(&format!("rectangle:{id}"))?;
+            self.report.alert_commands += 1;
+            self.report.applied += 1;
+            return Ok(());
+        }
         match table_of(kind) {
             Some(table) => self.remove_row(table, local.index)?,
             None => {

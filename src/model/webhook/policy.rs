@@ -3,6 +3,7 @@
 //! encoded, how a URL is redacted for display, and which Content-Type the body gets.
 //! One place, so the editor, the store and the request builder cannot disagree.
 
+use crate::model::alert::rectangle::RectangleLiveEvent;
 use crate::model::alert::{AlertEventOrigin, AlertTriggerEvent};
 use crate::model::webhook::{WebhookDeliveryError, WebhookHeader};
 
@@ -673,6 +674,16 @@ pub fn price_event_is_sendable(
     delivery_enabled
         && event.origin == AlertEventOrigin::Live
         && now_ms - event.timestamp_ms <= MAXIMUM_EVENT_AGE_MS
+}
+
+pub fn rectangle_event_is_sendable(
+    event: &RectangleLiveEvent,
+    delivery_enabled: bool,
+    now_ms: i64,
+) -> bool {
+    delivery_enabled
+        && now_ms >= event.detected_at_ms
+        && now_ms.saturating_sub(event.detected_at_ms) <= MAXIMUM_EVENT_AGE_MS
 }
 
 #[cfg(test)]

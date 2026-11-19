@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "DegenView (Windows Debug)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\target-debug\\debug\\degenview.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "DEGENVIEW_NO_KEYCHAIN",
+                    "value": "1"
+                },
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "cargo build (debugger)"
+        }
+    ]
+}

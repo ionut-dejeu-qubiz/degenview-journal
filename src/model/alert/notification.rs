@@ -1,8 +1,9 @@
-//! What an alert says to the user, and how a macOS notification delivery is retried:
+//! What an alert says to the user, and how a system notification delivery is retried:
 //! the title and body of the notification and the in-app banner, the user's notification
 //! settings applied, and the delivery state machine (pending → delivered, or failed with
 //! a growing back-off until it is given up on). Pure: the OS call itself is the host's.
 
+use crate::model::alert::rectangle::RectangleLiveEvent;
 use crate::model::alert::{
     AlertDeliveryRecord, AlertDeliveryState, AlertEventOrigin, AlertNotificationSettings,
     AlertTriggerEvent,
@@ -26,7 +27,7 @@ pub struct NotificationContent {
     pub user_info: Vec<(String, String)>,
 }
 
-/// Whether anything is shown at all: the master switch and the macOS switch.
+/// Whether anything is shown at all: the master switch and the system-notification switch.
 pub fn notifications_enabled(settings: &AlertNotificationSettings) -> bool {
     settings.delivery_enabled && settings.macos_notifications_enabled
 }
@@ -62,6 +63,27 @@ pub fn price_alert_content(
         sound: settings.sound_enabled,
         user_info: vec![
             ("alertID".to_owned(), event.alert_id.to_string()),
+            ("eventID".to_owned(), event.id.to_string()),
+        ],
+    }
+}
+
+pub fn rectangle_alert_content(
+    event: &RectangleLiveEvent,
+    settings: &AlertNotificationSettings,
+) -> NotificationContent {
+    NotificationContent {
+        title: format!("{} rectangle alert", event.alert.asset.symbol),
+        body: format!(
+            "Touched {}–{} at {}",
+            event.alert.currency.format_price(event.alert.low),
+            event.alert.currency.format_price(event.alert.high),
+            event.alert.currency.format_price(event.observed_price)
+        ),
+        identifier: event.id.to_string(),
+        sound: settings.sound_enabled,
+        user_info: vec![
+            ("rectangleAlertID".to_owned(), event.alert.id.to_string()),
             ("eventID".to_owned(), event.id.to_string()),
         ],
     }
@@ -256,11 +278,14 @@ mod tests {
             ..Default::default()
         };
         assert!(!notifications_enabled(&master_off) && !banners_enabled(&master_off));
-        let no_macos = AlertNotificationSettings {
+        let no_system_notifications = AlertNotificationSettings {
             macos_notifications_enabled: false,
             ..Default::default()
         };
-        assert!(!notifications_enabled(&no_macos) && banners_enabled(&no_macos));
+        assert!(
+            !notifications_enabled(&no_system_notifications)
+                && banners_enabled(&no_system_notifications)
+        );
         let no_banner = AlertNotificationSettings {
             in_app_banners_enabled: false,
             ..Default::default()

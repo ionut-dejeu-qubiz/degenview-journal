@@ -187,6 +187,22 @@ impl ChartCard {
             self.alert_lines = lines;
         }
     }
+
+    pub fn set_rectangle_alerts(
+        &mut self,
+        alerts: Vec<crate::model::alert::rectangle::RectangleAlert>,
+        checkpoints: Vec<crate::model::alert::rectangle::RectangleCheckpoint>,
+        muted: std::collections::HashSet<u64>,
+    ) {
+        if self.rectangle_alerts != alerts
+            || self.rectangle_checkpoints != checkpoints
+            || self.rectangle_muted_alerts != muted
+        {
+            self.rectangle_alerts = alerts;
+            self.rectangle_checkpoints = checkpoints;
+            self.rectangle_muted_alerts = muted;
+        }
+    }
 }
 
 #[cfg(test)]

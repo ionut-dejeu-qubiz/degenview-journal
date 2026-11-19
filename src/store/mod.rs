@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod paper;
 pub mod pine;
 pub mod portfolio;
+pub mod rectangle;
 pub mod scripts;
 pub mod sync;
 pub mod watchlist;
@@ -103,7 +104,7 @@ pub trait Document {
     fn document_id(&self) -> String;
 }
 
-pub(crate) const DOCUMENT_TABLES: [&str; 14] = [
+pub(crate) const DOCUMENT_TABLES: [&str; 16] = [
     "saved_view",
     "chart_template",
     "drawing_template",
@@ -114,6 +115,8 @@ pub(crate) const DOCUMENT_TABLES: [&str; 14] = [
     "portfolio",
     "paper_account",
     "price_alert",
+    "rectangle_alert",
+    "rectangle_alert_checkpoint",
     "webhook_endpoint",
     "pine_alert_subscription",
     "mcp_client",
@@ -168,6 +171,12 @@ impl Store {
                 );"
             ))?;
         }
+        self.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS rectangle_checkpoint_due
+             ON rectangle_alert_checkpoint (
+                 CASE WHEN json_valid(payload) THEN json_extract(payload, '$.next_due_ms') END
+             );",
+        )?;
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS setting (
                 key TEXT PRIMARY KEY,
@@ -236,6 +245,23 @@ impl Store {
                 payload TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS alert_command_on_created_at ON alert_command (created_at);",
+        )?;
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rectangle_alert_command (
+                id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS rectangle_alert_command_on_created_at
+                ON rectangle_alert_command (created_at);
+            CREATE TABLE IF NOT EXISTS rectangle_alert_event (
+                id TEXT PRIMARY KEY,
+                alert_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS rectangle_alert_event_on_alert
+                ON rectangle_alert_event (alert_id, timestamp);",
         )?;
 
         // Pine deliveries are claimed before notification/webhook dispatch. `dedupe_key` is null

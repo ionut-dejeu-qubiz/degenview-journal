@@ -10,6 +10,8 @@
 //! message.
 
 use crate::model::alert::AlertCondition;
+use crate::model::alert::rectangle::RectangleAlert;
+use crate::model::alert::rectangle::RectangleCheckpoint;
 use crate::model::chart;
 use crate::model::chart::clipboard::DrawingClip;
 use crate::model::chart::context::{
@@ -32,6 +34,7 @@ use crate::workspace::overlay::actions::reverts_to_regular;
 use crate::workspace::undo::Snapshot;
 use crate::workspace::*;
 use eframe::egui::{Context, Id, Pos2};
+use std::collections::{HashMap, HashSet};
 
 /// How long a message stays up.
 const NOTICE_LIFETIME: Duration = Duration::from_secs(4);
@@ -71,6 +74,12 @@ pub(in crate::workspace) struct ContextState {
     templates_chart: Option<u64>,
     /// The price alerts the app holds, for the chart's alert lines and their menu.
     pub(in crate::workspace) alerts: Vec<PriceAlert>,
+    /// Time-boxed zones painted over every chart of their market.
+    pub(in crate::workspace) rectangle_alerts: Vec<RectangleAlert>,
+    rectangle_checkpoints: Vec<RectangleCheckpoint>,
+    rectangle_muted_alerts: HashSet<u64>,
+    rectangle_alerts_applied: HashMap<u64, Option<crate::model::InstrumentId>>,
+    rectangle_alerts_replay: Option<bool>,
     /// The last time and price the pointer was over a chart's plot, where a pasted copy lands.
     hover: Option<(u64, crate::model::Anchor)>,
     table: TableViewState,
@@ -161,6 +170,90 @@ impl ChartWorkspace {
         if self.context.alerts != alerts {
             self.context.alerts = alerts.to_vec();
         }
+    }
+
+    pub fn set_rectangle_alerts(
+        &mut self,
+        alerts: &[RectangleAlert],
+        checkpoints: &[RectangleCheckpoint],
+        muted: &HashSet<u64>,
+    ) {
+        let replay = self.replay.is_active();
+        if self.context.rectangle_alerts != alerts
+            || self.context.rectangle_checkpoints != checkpoints
+            || self.context.rectangle_muted_alerts != *muted
+            || self.context.rectangle_alerts_replay != Some(replay)
+        {
+            self.context.rectangle_alerts = alerts.to_vec();
+            self.context.rectangle_checkpoints = checkpoints.to_vec();
+            self.context.rectangle_muted_alerts.clone_from(muted);
+            self.context.rectangle_alerts_replay = Some(replay);
+            self.context.rectangle_alerts_applied.clear();
+        }
+        let chart_ids: HashSet<u64> = self.charts.iter().map(|chart| chart.id).collect();
+        self.context
+            .rectangle_alerts_applied
+            .retain(|chart_id, _| chart_ids.contains(chart_id));
+        for chart in &mut self.charts {
+            let market = chart
+                .is_market()
+                .then(|| crate::model::InstrumentId::new(chart.source, &chart.symbol));
+            if self.context.rectangle_alerts_applied.get(&chart.id) == Some(&market) {
+                continue;
+            }
+            let alerts: Vec<RectangleAlert> = if replay {
+                Vec::new()
+            } else {
+                let Some(instrument) = &market else {
+                    self.context
+                        .rectangle_alerts_applied
+                        .insert(chart.id, market);
+                    chart
+                        .chart
+                        .set_rectangle_alerts(Vec::new(), Vec::new(), HashSet::new());
+                    continue;
+                };
+                self.context
+                    .rectangle_alerts
+                    .iter()
+                    .filter(|alert| alert.asset.instrument == *instrument)
+                    .cloned()
+                    .collect()
+            };
+            let checkpoints: Vec<RectangleCheckpoint> = checkpoints
+                .iter()
+                .filter(|checkpoint| alerts.iter().any(|alert| alert.id == checkpoint.id))
+                .cloned()
+                .collect();
+            let muted: HashSet<u64> = alerts
+                .iter()
+                .filter(|alert| muted.contains(&alert.id))
+                .map(|alert| alert.id)
+                .collect();
+            chart.chart.set_rectangle_alerts(alerts, checkpoints, muted);
+            self.context
+                .rectangle_alerts_applied
+                .insert(chart.id, market);
+        }
+    }
+
+    pub fn refresh_rectangle_alerts(&mut self) -> Result<(), String> {
+        let (alerts, checkpoints, muted) = {
+            let store = crate::lock::lock(&self.store);
+            (
+                store
+                    .rectangle_alerts_cached()
+                    .map_err(|error| error.to_string())?,
+                store
+                    .rectangle_checkpoints_cached()
+                    .map_err(|error| error.to_string())?,
+                store
+                    .muted_rectangle_alerts_cached()
+                    .map_err(|error| error.to_string())?,
+            )
+        };
+        self.set_rectangle_alerts(&alerts, &checkpoints, &muted);
+        Ok(())
     }
 
     // MARK: Messages

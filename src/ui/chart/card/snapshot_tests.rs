@@ -408,6 +408,55 @@ fn alerts_and_the_account_snapshot_as_the_chart_shows_them() {
 }
 
 #[test]
+fn rectangle_alert_zones_appear_the_same_in_live_charts_and_snapshots() {
+    let mut harness = Harness::new(ChartCanvas::default());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base_ms = now_ms - 250 * HOUR;
+    for (index, candle) in harness.candles.iter_mut().enumerate() {
+        candle.open_time = base_ms + index as i64 * HOUR;
+        candle.close_time = candle.open_time + HOUR - 1;
+    }
+    let alert = crate::model::alert::rectangle::RectangleAlert::new_live_touch(
+        crate::model::alert::AlertAsset::new(
+            crate::model::InstrumentId::new(DataSource::Binance, "BTCUSDT"),
+            "BTC",
+            "Bitcoin",
+        ),
+        base_ms + 220 * HOUR,
+        base_ms + 280 * HOUR,
+        210.0,
+        240.0,
+        base_ms + 200 * HOUR,
+    )
+    .unwrap();
+    let checkpoint = crate::model::alert::rectangle::RectangleCheckpoint::new(&alert, now_ms);
+    let alert_id = alert.id;
+    harness.card.set_rectangle_alerts(
+        vec![alert.clone()],
+        vec![checkpoint.clone()],
+        Default::default(),
+    );
+
+    let (_, rect) = settled(&mut harness);
+    let snapshot = dumped(&snapshot_shapes(&harness, rect, false));
+    assert!(snapshot.iter().any(|shape| shape.contains("Live touch")));
+    same_as_live(&mut harness, false);
+
+    harness.card.set_rectangle_alerts(
+        vec![alert],
+        vec![checkpoint],
+        std::collections::HashSet::from([alert_id]),
+    );
+    let (_, rect) = settled(&mut harness);
+    let snapshot = dumped(&snapshot_shapes(&harness, rect, false));
+    assert!(snapshot.iter().any(|shape| shape.contains("Not watching")));
+    same_as_live(&mut harness, false);
+}
+
+#[test]
 fn the_account_stays_out_of_a_snapshot_unless_asked_for() {
     let mut harness = Harness::new(ChartCanvas::default());
     with_account(&mut harness);

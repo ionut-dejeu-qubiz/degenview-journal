@@ -27,7 +27,7 @@ pub enum Control {
 
 /// The window's application id (Wayland `app_id`, X11 class): what a Linux launcher or taskbar
 /// matches to the `.desktop` file, and so to its icon. Permanent; see `docs/flatpak.md`.
-pub const APP_ID: &str = "es.nico.degenview";
+pub const APP_ID: &str = crate::platform::APPLICATION_ID;
 
 /// The app icon with its corners rounded, for the window systems that draw an icon as it is.
 #[cfg(not(target_os = "macos"))]

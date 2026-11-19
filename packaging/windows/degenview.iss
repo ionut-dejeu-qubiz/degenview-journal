@@ -69,8 +69,8 @@ Source: "..\..\assets\fonts\OFL-NotoSansSymbols2.txt"; DestDir: "{app}\licenses"
 Source: "..\..\assets\fonts\README.md"; DestDir: "{app}\licenses"; DestName: "FONTS.md"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\DegenView"; Filename: "{app}\degenview.exe"
-Name: "{autodesktop}\DegenView"; Filename: "{app}\degenview.exe"; Tasks: desktopicon
+Name: "{autoprograms}\DegenView"; Filename: "{app}\degenview.exe"; AppUserModelID: "es.nico.degenview"
+Name: "{autodesktop}\DegenView"; Filename: "{app}\degenview.exe"; Tasks: desktopicon; AppUserModelID: "es.nico.degenview"
 
 [Run]
 Filename: "{app}\degenview.exe"; Description: "{cm:LaunchProgram,DegenView}"; Flags: nowait postinstall skipifsilent

@@ -14,7 +14,7 @@ use super::DegenViewApp;
 use super::now_ms;
 use super::tabs::TabContent;
 use crate::host::alert::AlertHost;
-use crate::host::alert::runtime::{AlertRuntimeRunner, GuiRuntimeDecision};
+use crate::host::alert::runtime::{AlertRuntimeEvents, AlertRuntimeRunner, GuiRuntimeDecision};
 use crate::lock::lock;
 use crate::model::alert::pine::PineAlertSubscription;
 use crate::model::alert::{AlertCurrency, AlertRuntimeOwner, AlertServiceState, AlertState};
@@ -28,7 +28,7 @@ use crate::ui::alert::banner::{self, AlertBannerState};
 use eframe::egui;
 use fx::AlertFxFeed;
 use registration::{AlertRegistration, AlertRuntimeControl};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use window::{AlertsWindow, AlertsWindowEnv};
 
@@ -41,6 +41,8 @@ pub(super) struct AlertCoordinator {
     fx: AlertFxFeed,
     window: AlertsWindow,
     banner: AlertBannerState,
+    rectangle_banner_started_at_ms: i64,
+    rectangle_bannered_ids: HashSet<u64>,
 }
 
 impl AlertCoordinator {
@@ -50,11 +52,12 @@ impl AlertCoordinator {
         host: AlertHost,
         notifier: Arc<dyn Notifier>,
         fx_rates: Arc<FxRateService>,
+        has_rectangle_alerts: bool,
     ) -> Self {
         let runtime_started_at = now_ms();
-        let has_price_alerts = !host.snapshot().alerts.is_empty();
+        let has_alerts = !host.snapshot().alerts.is_empty() || has_rectangle_alerts;
         let mut service = BackgroundAlertService::default();
-        let service_state = if has_price_alerts {
+        let service_state = if has_alerts {
             service.ensure_registered()
         } else {
             service.status()
@@ -67,6 +70,8 @@ impl AlertCoordinator {
             fx: AlertFxFeed::new(fx_rates),
             window: AlertsWindow::default(),
             banner: AlertBannerState::default(),
+            rectangle_banner_started_at_ms: runtime_started_at,
+            rectangle_bannered_ids: HashSet::new(),
         }
     }
 
@@ -118,11 +123,12 @@ impl AlertCoordinator {
 
     /// An active alert is priced in a currency other than the dollar.
     fn alerts_need_fx_rates(&self) -> bool {
-        self.host.lock().is_ok_and(|host| {
-            host.snapshot().alerts.iter().any(|alert| {
-                alert.state == AlertState::Active && alert.currency != AlertCurrency::Usd
+        self.runner.rectangle_needs_fx_rates()
+            || self.host.lock().is_ok_and(|host| {
+                host.snapshot().alerts.iter().any(|alert| {
+                    alert.state == AlertState::Active && alert.currency != AlertCurrency::Usd
+                })
             })
-        })
     }
 
     /// One turn of the alerts: new FX rates, a fetch when an alert or a sheet (`charts_need_fx`
@@ -149,7 +155,9 @@ impl AlertCoordinator {
             .unwrap_or_default();
         let turn = self.registration.decide(&health, now);
 
-        let events = if turn.decision == GuiRuntimeDecision::Foreground && turn.owns_lease {
+        let events = if turn.decision == GuiRuntimeDecision::Foreground
+            && let Some(lease) = turn.lease.as_ref()
+        {
             let mut host = lock(&self.host);
             let runtime_state = if turn.service_state == AlertServiceState::Enabled {
                 AlertServiceState::Disabled
@@ -161,21 +169,52 @@ impl AlertCoordinator {
                 store,
                 quote_book,
                 quote_coordinator,
-                self.registration.notifier().as_ref(),
+                Arc::clone(self.registration.notifier()),
                 self.fx.rates(),
                 runtime_state,
                 now,
+                lease,
             )
         } else {
             self.runner.suspend_quotes(quote_coordinator);
             let store = lock(store);
-            lock(&self.host).reload_from_store(&store, now)
+            AlertRuntimeEvents {
+                price: lock(&self.host).reload_from_store(&store, now),
+                rectangles: Vec::new(),
+            }
         };
-        if !events.is_empty()
+        let recent_rectangles = match lock(store).recent_rectangle_events_cached(now) {
+            Ok(events) => events,
+            Err(error) => {
+                if let Ok(mut host) = self.host.lock() {
+                    host.set_rectangle_error(Some(format!(
+                        "Rectangle notification events could not be read: {error}"
+                    )));
+                }
+                Vec::new()
+            }
+        };
+        let recent_ids: HashSet<_> = recent_rectangles.iter().map(|event| event.id).collect();
+        self.rectangle_bannered_ids
+            .retain(|event_id| recent_ids.contains(event_id));
+
+        if (!events.price.is_empty()
+            || !events.rectangles.is_empty()
+            || !recent_rectangles.is_empty())
             && let Ok(host) = self.host.lock()
         {
-            for event in &events {
+            for event in &events.price {
                 self.banner.show_price(event, host.settings(), now);
+            }
+            for event in events
+                .rectangles
+                .iter()
+                .chain(recent_rectangles.iter())
+                .filter(|event| event.detected_at_ms >= self.rectangle_banner_started_at_ms)
+            {
+                if self.rectangle_bannered_ids.insert(event.id) {
+                    self.banner.show_rectangle(event, host.settings(), now);
+                }
             }
         }
     }

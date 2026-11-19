@@ -118,6 +118,7 @@ pub fn merge(kind: EntityKind, base: Option<&Value>, local: Side, remote: Side) 
         | EntityKind::DrawingTemplate
         | EntityKind::EditorTheme
         | EntityKind::Alert
+        | EntityKind::RectangleAlert
         | EntityKind::Portfolio
         | EntityKind::PortfolioTransaction => Outcome::Resolved(lww(&local, &remote).clone()),
     }

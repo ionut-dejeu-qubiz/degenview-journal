@@ -143,6 +143,24 @@ timeline scrubber, speed and interval controls, and shared clock across every ch
 cargo run
 ```
 
+**Debugging on Windows with VS Code**
+
+Install Microsoft's C/C++ extension (`ms-vscode.cpptools`), then select
+**DegenView (Windows Debug)** in Run and Debug and press **F5**. The configuration in
+[.vscode/launch.json](.vscode/launch.json) runs the build task in
+[.vscode/tasks.json](.vscode/tasks.json) before launching.
+
+The C/C++ extension supplies the debugger, not the compiler. Install Visual Studio's
+**Desktop development with C++** workload for MSVC and the Windows SDK. The task initializes
+MSVC through `vcvars64.bat` in `C:\Program Files\Microsoft Visual Studio\18\Community`;
+adjust that path if your Visual Studio version or edition differs.
+
+The task uses the lockfile and enables full debug information for the app in a separate
+`target-debug` directory, leaving normal builds unchanged. The launch sets
+`DEGENVIEW_NO_KEYCHAIN=1` for development and enables Rust backtraces.
+If Windows Application Control blocks generated build scripts or the app, administrator
+approval is required; this configuration does not bypass that policy.
+
 Build a release binary:
 
 ```bash

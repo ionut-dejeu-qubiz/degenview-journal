@@ -68,6 +68,23 @@ struct SnapshotOverlays<'a> {
 }
 
 impl Overlays for SnapshotOverlays<'_> {
+    fn after_drawings(
+        &mut self,
+        _layer: &mut DrawingLayer,
+        projection: &Projection,
+        _drawing: &mut DrawingFrame,
+        layout: &FrameLayout,
+    ) {
+        alert_zones::paint(
+            &self.painter,
+            projection,
+            &self.card.rectangle_alerts,
+            &self.card.rectangle_checkpoints,
+            &self.card.rectangle_muted_alerts,
+            layout.top_inset,
+        );
+    }
+
     fn pane(&mut self, painter: &egui::Painter, layout: &FrameLayout, slot: &PaneSlot) {
         paint_pane_title(painter, layout, slot, false);
     }

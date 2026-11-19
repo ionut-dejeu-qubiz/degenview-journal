@@ -2038,6 +2038,464 @@ fn an_alert_arrives_on_the_other_mac_defined_but_switched_off() {
 }
 
 #[test]
+fn an_unknown_alert_condition_survives_sync_and_runtime_rewrites() {
+    let (_cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let payload = json!({
+        "tag": "futureRectangle",
+        "target": {"low": 10.0, "high": 20.0},
+        "window": {"start": T0, "end": T0 + 100_000},
+        "mode": ["touch", {"timeframe": "1h"}]
+    });
+    let alert = PriceAlert::new(btc(), serde_json::from_value(payload.clone()).unwrap(), T0);
+    let id = alert.id;
+    send_command(
+        &a,
+        AlertRuntimeCommandPayload::Save {
+            alert: Box::new(alert),
+            baseline: None,
+        },
+    );
+    owner_tick(&a, T0);
+    settle_with_alerts(&mut a, &mut b);
+
+    for mac in [&a, &b] {
+        let alerts = alerts_on(mac);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].id, id);
+        assert_eq!(alerts[0].state, AlertState::Unsupported);
+        assert_eq!(serde_json::to_value(&alerts[0].condition).unwrap(), payload);
+        assert_eq!(outbox_len(mac), 0);
+    }
+}
+
+fn rectangle_definition(id: u64) -> crate::model::alert::rectangle::RectangleAlert {
+    serde_json::from_value(json!({
+        "id": id,
+        "format_version": 1,
+        "asset": btc(),
+        "start_ms": T0,
+        "end_ms": 4_102_444_800_000_i64,
+        "low": 10.0,
+        "high": 20.0,
+        "mode": {"candle_close": {"timeframe": "Hour"}},
+        "frequency": "EveryTime",
+        "currency": "Usd",
+        "paused": false,
+        "note": "",
+        "webhook_endpoint_ids": [],
+        "webhook_message": null,
+        "created_at_ms": T0
+    }))
+    .unwrap()
+}
+
+#[test]
+fn rectangle_definitions_sync_via_the_runtime_queue_and_arrive_muted() {
+    use crate::model::alert::rectangle::{
+        RectangleAlert, RectangleCheckpoint, RectangleCommand, RectangleCommandPayload,
+        RectanglePhase,
+    };
+
+    let (cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let mut alert = rectangle_definition(701);
+    let save = |mac: &Mac, alert: RectangleAlert| {
+        let store = mac.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Save(Box::new(alert)),
+                T0,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+    };
+    save(&a, alert.clone());
+    settle(&mut a, &mut b);
+    {
+        let store = b.store.lock().unwrap();
+        assert!(store.rectangle_commands_pending().unwrap());
+        assert!(matches!(
+            store
+                .load_projected(EntityKind::RectangleAlert, "701")
+                .unwrap(),
+            crate::store::sync::Load::Deferred
+        ));
+        store.reconcile_stored().unwrap();
+        assert!(store.outbox().unwrap().is_empty());
+        assert!(
+            store
+                .documents_strict::<RectangleAlert>("rectangle_alert")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.alert_local("rectangle:701").unwrap(),
+            Some((false, "remote".into()))
+        );
+        store.process_rectangle_commands(T0).unwrap();
+        assert_eq!(
+            store
+                .documents_strict::<RectangleAlert>("rectangle_alert")
+                .unwrap(),
+            vec![alert.clone()]
+        );
+    }
+    settle(&mut a, &mut b);
+    assert_eq!(outbox_len(&a), 0);
+    assert_eq!(outbox_len(&b), 0);
+
+    let saves_before_checkpoint = cloud.save_attempts();
+    {
+        let store = a.store.lock().unwrap();
+        let mut checkpoints: Vec<RectangleCheckpoint> = store
+            .documents_strict("rectangle_alert_checkpoint")
+            .unwrap();
+        checkpoints[0].phase = RectanglePhase::Triggered;
+        store
+            .replace_documents("rectangle_alert_checkpoint", &checkpoints)
+            .unwrap();
+    }
+    settle(&mut a, &mut b);
+    assert_eq!(cloud.save_attempts(), saves_before_checkpoint);
+    assert_eq!(
+        b.store
+            .lock()
+            .unwrap()
+            .documents_strict::<RectangleCheckpoint>("rectangle_alert_checkpoint")
+            .unwrap()[0]
+            .phase,
+        RectanglePhase::Active
+    );
+
+    alert.high = 25.0;
+    save(&a, alert.clone());
+    settle(&mut a, &mut b);
+    b.store
+        .lock()
+        .unwrap()
+        .process_rectangle_commands(T0)
+        .unwrap();
+    assert_eq!(
+        b.store
+            .lock()
+            .unwrap()
+            .documents_strict::<RectangleAlert>("rectangle_alert")
+            .unwrap(),
+        vec![alert]
+    );
+    settle(&mut a, &mut b);
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Delete(701),
+                T0 + 1,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    settle(&mut a, &mut b);
+    for _ in 0..4 {
+        b.store
+            .lock()
+            .unwrap()
+            .process_rectangle_commands(T0)
+            .unwrap();
+        settle(&mut a, &mut b);
+    }
+    {
+        let store = b.store.lock().unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+        assert!(
+            store
+                .documents_strict::<RectangleAlert>("rectangle_alert")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.alert_local("rectangle:701").unwrap(), None);
+    }
+    assert_eq!(outbox_len(&a), 0);
+    assert_eq!(outbox_len(&b), 0);
+    assert!(
+        !cloud
+            .names()
+            .iter()
+            .any(|name| name == "rectanglealert.701")
+    );
+}
+
+#[test]
+fn a_newer_rectangle_definition_is_preserved_in_the_sync_inbox() {
+    let (cloud, mut a, _b) = pair();
+    a.core.start();
+    let body = json!({
+        "id": 702,
+        "format_version": 2,
+        "unknown": {"nested": [1, 2, 3]}
+    });
+    cloud.put_from_elsewhere(raw("rectanglealert.702", &body, 1, T0, "B"), "B");
+    a.core.request_sync();
+    a.run();
+    let store = a.store.lock().unwrap();
+    let entry = store
+        .inbox()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.record_name == "rectanglealert.702")
+        .expect("future record stays in the inbox");
+    assert_eq!(entry.reason, "newer_schema");
+    let payload: Value = serde_json::from_slice(&entry.payload).unwrap();
+    assert_eq!(payload, body);
+    assert!(store.raw_rows("rectangle_alert").unwrap().is_empty());
+}
+
+#[test]
+fn pending_rectangle_commands_defer_outbox_uploads() {
+    use crate::model::alert::rectangle::{RectangleCommand, RectangleCommandPayload};
+
+    let (cloud, mut a, _b) = pair();
+    a.core.start();
+    let alert = rectangle_definition(703);
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Save(Box::new(alert)),
+                T0,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Delete(703),
+                T0 + 1,
+            ))
+            .unwrap();
+    }
+    a.core.request_sync();
+    a.run();
+    assert!(
+        !cloud
+            .names()
+            .iter()
+            .any(|name| name == "rectanglealert.703")
+    );
+    assert!(!a.outbox().is_empty(), "the local edit remains queued");
+    a.store
+        .lock()
+        .unwrap()
+        .process_rectangle_commands(T0)
+        .unwrap();
+    a.core.request_sync();
+    a.run();
+    assert!(
+        !cloud
+            .names()
+            .iter()
+            .any(|name| name == "rectanglealert.703")
+    );
+}
+
+#[test]
+fn live_rectangle_events_and_progress_remain_device_local() {
+    use crate::model::alert::rectangle::{
+        RectangleCommand, RectangleCommandPayload, RectangleMode,
+    };
+    use crate::model::watchlist::quote::{Freshness, WatchlistQuote};
+
+    let (cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let mut alert = rectangle_definition(707);
+    alert.mode = RectangleMode::LiveTouch;
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Save(Box::new(alert)),
+                T0,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    settle(&mut a, &mut b);
+    b.store
+        .lock()
+        .unwrap()
+        .process_rectangle_commands(T0)
+        .unwrap();
+    settle(&mut a, &mut b);
+    let saves = cloud.save_attempts();
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .evaluate_rectangle_quotes(T0, &std::collections::HashMap::new(), |_| {
+                Some(WatchlistQuote {
+                    last: Some(15.0),
+                    timestamp_ms: Some(T0),
+                    freshness: Freshness::Live,
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+        let count: i64 = store
+            .raw_connection()
+            .query_row("SELECT COUNT(*) FROM rectangle_alert_event", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    settle(&mut a, &mut b);
+    assert_eq!(cloud.save_attempts(), saves);
+    let count: i64 = b
+        .store
+        .lock()
+        .unwrap()
+        .raw_connection()
+        .query_row("SELECT COUNT(*) FROM rectangle_alert_event", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn queued_rectangle_sync_records_resume_without_another_remote_change() {
+    use crate::model::alert::rectangle::{
+        RectangleAlert, RectangleCommand, RectangleCommandPayload,
+    };
+    use crate::sync::engine::core::Effect;
+
+    let (_cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    {
+        let store = a.store.lock().unwrap();
+        for id in [704, 705] {
+            store
+                .enqueue_rectangle_command(&RectangleCommand::new(
+                    RectangleCommandPayload::Save(Box::new(rectangle_definition(id))),
+                    T0,
+                ))
+                .unwrap();
+        }
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    settle(&mut a, &mut b);
+    {
+        let store = b.store.lock().unwrap();
+        assert!(store.rectangle_commands_pending().unwrap());
+        assert!(store.rectangle_sync_waiting().unwrap());
+        store.process_rectangle_commands(T0).unwrap();
+        assert_eq!(
+            store
+                .documents_strict::<RectangleAlert>("rectangle_alert")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    b.core.tick();
+    let batch = b
+        .core
+        .take_effects()
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::RemoteChanges(batch) => Some(batch),
+            _ => None,
+        })
+        .expect("an idle runtime schedules the deferred rectangle");
+    b.apply_to_store(&batch);
+    b.core.remote_applied(batch.id);
+    let store = b.store.lock().unwrap();
+    assert!(store.rectangle_commands_pending().unwrap());
+    store.process_rectangle_commands(T0).unwrap();
+    assert_eq!(
+        store
+            .documents_strict::<RectangleAlert>("rectangle_alert")
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(!store.rectangle_sync_waiting().unwrap());
+}
+
+#[test]
+fn a_rectangle_deleted_while_its_save_is_pending_is_not_resurrected() {
+    use crate::model::alert::rectangle::{
+        RectangleAlert, RectangleCommand, RectangleCommandPayload,
+    };
+    use crate::sync::engine::core::Effect;
+
+    let (_cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Save(Box::new(rectangle_definition(706))),
+                T0,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    settle(&mut a, &mut b);
+    assert!(
+        b.store
+            .lock()
+            .unwrap()
+            .rectangle_commands_pending()
+            .unwrap()
+    );
+    {
+        let store = a.store.lock().unwrap();
+        store
+            .enqueue_rectangle_command(&RectangleCommand::new(
+                RectangleCommandPayload::Delete(706),
+                T0 + 1,
+            ))
+            .unwrap();
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    a.core.request_sync();
+    a.run();
+    b.core.request_sync();
+    b.run();
+    {
+        let store = b.store.lock().unwrap();
+        assert!(store.rectangle_sync_waiting().unwrap());
+        store.process_rectangle_commands(T0).unwrap();
+    }
+    b.core.tick();
+    let batch = b
+        .core
+        .take_effects()
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::RemoteChanges(batch) => Some(batch),
+            _ => None,
+        })
+        .expect("an idle runtime schedules the deferred deletion");
+    b.apply_to_store(&batch);
+    b.core.remote_applied(batch.id);
+    let store = b.store.lock().unwrap();
+    assert!(store.rectangle_commands_pending().unwrap());
+    store.process_rectangle_commands(T0).unwrap();
+    assert!(
+        store
+            .documents_strict::<RectangleAlert>("rectangle_alert")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.alert_local("rectangle:706").unwrap(), None);
+}
+
+#[test]
 fn a_switched_off_alert_does_not_fire_on_the_receiving_mac_and_can_be_switched_on() {
     let (_cloud, mut a, mut b) = pair();
     a.core.start();

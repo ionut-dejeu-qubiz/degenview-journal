@@ -9,21 +9,23 @@ use crate::model::alert::feed::UnseenAlerts;
 use crate::model::alert::message::render_for_event;
 use crate::model::alert::notification::{
     begin_attempt, delivered, failed, notifications_enabled, pending_deliveries,
-    price_alert_content, script_alert_content, suppressed,
+    price_alert_content, rectangle_alert_content, script_alert_content, suppressed,
 };
 use crate::model::alert::pine::PineAlertSubscription;
+use crate::model::alert::rectangle;
 use crate::model::alert::{
     AlertCurrency, AlertNotificationSettings, AlertPersistenceSnapshot, AlertRuntimeHealth,
     AlertTriggerEvent, MarketQuote,
 };
 use crate::model::watchlist::quote::maximum_age_secs;
 use crate::model::webhook::WebhookDeliverySource;
-use crate::model::webhook::policy::price_event_is_sendable;
+use crate::model::webhook::policy::{price_event_is_sendable, rectangle_event_is_sendable};
 use crate::pine::runtime::state::AlertEvent;
 use crate::service::alert::macos_notifications::Notifier;
 use crate::service::keychain::webhook_secrets::KeychainWebhookSecretStore;
 use crate::service::watchlist_quotes::WatchlistQuoteBook;
 use crate::service::webhook::delivery::{self, Mode, UreqTransport};
+use crate::service::work_queue;
 use crate::store::{SharedStore, Store};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ pub struct AlertHost {
     dirty: bool,
     pending_ack_ids: Vec<u64>,
     load_error: Option<String>,
+    rectangle_error: Option<String>,
     transport: Arc<UreqTransport>,
     secrets: Arc<KeychainWebhookSecretStore>,
 }
@@ -55,6 +58,7 @@ impl AlertHost {
             dirty: false,
             pending_ack_ids: Vec::new(),
             load_error,
+            rectangle_error: None,
             transport: Arc::new(UreqTransport::default()),
             secrets: Arc::new(KeychainWebhookSecretStore::default()),
         }
@@ -91,6 +95,22 @@ impl AlertHost {
 
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
+    }
+
+    pub fn rectangle_error(&self) -> Option<&str> {
+        self.rectangle_error
+            .as_deref()
+            .or(self.engine.snapshot().health.rectangle_error.as_deref())
+    }
+
+    pub fn set_rectangle_error(&mut self, error: Option<String>) {
+        self.rectangle_error = error.clone();
+        let mut health = self.engine.snapshot().health.clone();
+        if health.rectangle_error != error {
+            health.rectangle_error = error;
+            self.engine.replace_health(health);
+            self.dirty = true;
+        }
     }
 
     pub fn active_instruments(&self) -> Vec<crate::model::InstrumentId> {
@@ -258,6 +278,100 @@ impl AlertHost {
                 });
             }
         }
+    }
+
+    /// Performs blocking reads and system notification calls on the alert worker, not a frame.
+    pub(super) fn dispatch_rectangle_events(
+        settings: AlertNotificationSettings,
+        store_handle: SharedStore,
+        notifier: Arc<dyn Notifier>,
+        transport: Arc<UreqTransport>,
+        secrets: Arc<KeychainWebhookSecretStore>,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let (pending, webhook_jobs) = {
+            let store = crate::lock::lock(&store_handle);
+            let recent = store.recent_rectangle_events(now_ms).map_err(|error| {
+                format!("Rectangle notification events could not be read: {error}")
+            })?;
+            let pending = store.pending_rectangle_events(now_ms).map_err(|error| {
+                format!("Rectangle notification events could not be read: {error}")
+            })?;
+            let mut webhook_jobs = Vec::new();
+            if settings.delivery_enabled {
+                let endpoints = store.webhook_endpoints();
+                for event in &recent {
+                    if !rectangle_event_is_sendable(event, true, now_ms) {
+                        continue;
+                    }
+                    for endpoint_id in &event.alert.webhook_endpoint_ids {
+                        let Some(endpoint) = endpoints
+                            .iter()
+                            .find(|endpoint| endpoint.id == *endpoint_id && endpoint.is_enabled)
+                        else {
+                            continue;
+                        };
+                        let Some(delivery_id) = store.claim_webhook_delivery(
+                            endpoint.id,
+                            WebhookDeliverySource::Rectangle,
+                            event.id,
+                            now_ms,
+                        ) else {
+                            continue;
+                        };
+                        webhook_jobs.push((
+                            delivery_id,
+                            endpoint.clone(),
+                            rectangle::render_webhook(
+                                event,
+                                event.alert.webhook_message.as_deref(),
+                                now_ms,
+                            ),
+                        ));
+                    }
+                }
+            }
+            (pending, webhook_jobs)
+        };
+
+        for (delivery_id, endpoint, message) in webhook_jobs {
+            let transport = Arc::clone(&transport);
+            let secrets = Arc::clone(&secrets);
+            let handle = Arc::clone(&store_handle);
+            work_queue::submit(move || {
+                let result = delivery::deliver(
+                    transport.as_ref(),
+                    secrets.as_ref(),
+                    &message,
+                    &endpoint,
+                    Mode::Production,
+                );
+                if let Ok(store) = handle.lock() {
+                    store.finish_webhook_delivery(delivery_id, &result);
+                }
+            });
+        }
+
+        for mut event in pending {
+            if !notifications_enabled(&settings)
+                || !rectangle_event_is_sendable(&event, settings.delivery_enabled, now_ms)
+            {
+                event.notification = suppressed(&event.notification);
+            } else {
+                let attempted = begin_attempt(&event.notification, now_ms);
+                let content = rectangle_alert_content(&event, &settings);
+                event.notification = match notifier.deliver(&content) {
+                    Ok(()) => delivered(&attempted),
+                    Err(error) => failed(&attempted, &error, now_ms),
+                };
+            }
+            crate::lock::lock(&store_handle)
+                .update_rectangle_event_notification(&event)
+                .map_err(|error| {
+                    format!("Rectangle notification status could not be saved: {error}")
+                })?;
+        }
+        Ok(())
     }
 
     /// Builds a `MarketQuote` per active alert asset (and per alert currency) from the shared quote
@@ -491,6 +605,55 @@ mod tests {
         assert!(store.pending_alert_commands().is_empty());
         // A revision is now written, so a reload finds a snapshot.
         assert!(store.load_alert_snapshot().expect("load").is_some());
+    }
+
+    #[test]
+    fn a_rectangle_queue_does_not_block_existing_alert_commands() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .raw_connection()
+            .execute(
+                "INSERT INTO rectangle_alert_command (id, created_at, payload) VALUES ('1', 1, '{}')",
+                [],
+            )
+            .unwrap();
+        store
+            .enqueue_alert_command(&AlertRuntimeCommand::new(
+                AlertRuntimeCommandPayload::ClearHistory,
+                1_000,
+            ))
+            .unwrap();
+        let mut host = AlertHost::load(&store, 1_000);
+        host.drain_commands(&store, 1_000);
+        host.save_if_dirty(&store);
+        assert!(host.load_error().is_none());
+        assert!(store.pending_alert_commands().is_empty());
+        assert!(store.rectangle_commands_pending().unwrap());
+        store
+            .raw_connection()
+            .execute("DELETE FROM rectangle_alert_command WHERE id = '1'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_background_rectangle_error_is_visible_to_a_new_host() {
+        let store = Store::open_in_memory().unwrap();
+        let snapshot = AlertPersistenceSnapshot {
+            health: AlertRuntimeHealth {
+                rectangle_error: Some("Rectangle alerts could not be saved".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store
+            .save_alert_snapshot_and_acknowledge(&snapshot, &[])
+            .unwrap();
+        let host = AlertHost::load(&store, 1_000);
+        assert_eq!(
+            host.rectangle_error(),
+            Some("Rectangle alerts could not be saved")
+        );
+        assert!(host.load_error().is_none());
     }
 
     #[test]

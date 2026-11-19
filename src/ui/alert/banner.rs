@@ -3,6 +3,7 @@
 //! stacking.
 
 use crate::model::alert::notification::banners_enabled;
+use crate::model::alert::rectangle::RectangleLiveEvent;
 use crate::model::alert::{AlertNotificationSettings, AlertTriggerEvent};
 use crate::ui::icons::{self, Icon};
 use crate::ui::{kit, theme};
@@ -39,6 +40,16 @@ pub fn price_banner_text(event: &AlertTriggerEvent) -> String {
     )
 }
 
+pub fn rectangle_banner_text(event: &RectangleLiveEvent) -> String {
+    format!(
+        "{} touched {}-{} at {}",
+        event.alert.asset.symbol,
+        event.alert.currency.format_price(event.alert.low),
+        event.alert.currency.format_price(event.alert.high),
+        event.alert.currency.format_price(event.observed_price)
+    )
+}
+
 impl AlertBannerState {
     #[cfg(test)]
     pub fn price(&self) -> Option<&Banner> {
@@ -62,6 +73,23 @@ impl AlertBannerState {
         self.price = Some(Banner {
             id: event.id,
             text: price_banner_text(event),
+            shown_at_ms: now_ms,
+        });
+        true
+    }
+
+    pub fn show_rectangle(
+        &mut self,
+        event: &RectangleLiveEvent,
+        settings: &AlertNotificationSettings,
+        now_ms: i64,
+    ) -> bool {
+        if !banners_enabled(settings) {
+            return false;
+        }
+        self.price = Some(Banner {
+            id: event.id,
+            text: rectangle_banner_text(event),
             shown_at_ms: now_ms,
         });
         true
@@ -153,7 +181,10 @@ fn capsule(ui: &mut egui::Ui, banner: &Banner) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::alert::{AlertAsset, AlertCurrency, AlertDeliveryRecord, AlertEventOrigin};
+    use crate::model::alert::rectangle::{RectangleAlert, RectangleLiveEvent, RectangleMode};
+    use crate::model::alert::{
+        AlertAsset, AlertCurrency, AlertDeliveryRecord, AlertEventOrigin, AlertFrequency,
+    };
     use crate::model::{DataSource, InstrumentId};
 
     fn event(id: u64) -> AlertTriggerEvent {
@@ -176,6 +207,34 @@ mod tests {
         }
     }
 
+    fn rectangle_event(id: u64) -> RectangleLiveEvent {
+        RectangleLiveEvent {
+            id,
+            alert: RectangleAlert {
+                id: 7,
+                format_version: 1,
+                asset: event(id).asset,
+                start_ms: 0,
+                end_ms: 1_000,
+                low: 10.0,
+                high: 20.0,
+                mode: RectangleMode::LiveTouch,
+                frequency: AlertFrequency::Once,
+                currency: AlertCurrency::Usd,
+                paused: false,
+                note: String::new(),
+                webhook_endpoint_ids: Vec::new(),
+                webhook_message: None,
+                created_at_ms: 0,
+            },
+            observed_price: 15.0,
+            quote_timestamp_ms: 100,
+            detected_at_ms: 100,
+            quote_fingerprint: "f".into(),
+            notification: AlertDeliveryRecord::default(),
+        }
+    }
+
     #[test]
     fn a_price_banner_names_the_level_that_was_reached() {
         assert_eq!(price_banner_text(&event(1)), "BTC reached $70,000.00");
@@ -183,6 +242,18 @@ mod tests {
         assert!(state.show_price(&event(1), &AlertNotificationSettings::default(), 100));
         assert_eq!(state.price().unwrap().text, "BTC reached $70,000.00");
         assert_eq!(state.price().unwrap().id, 1);
+    }
+
+    #[test]
+    fn a_rectangle_banner_shows_the_zone_and_trigger_price() {
+        let event = rectangle_event(8);
+        assert_eq!(
+            rectangle_banner_text(&event),
+            "BTC touched $10.00-$20.00 at $15.00"
+        );
+        let mut state = AlertBannerState::default();
+        assert!(state.show_rectangle(&event, &AlertNotificationSettings::default(), 100));
+        assert_eq!(state.price().unwrap().id, 8);
     }
 
     #[test]
@@ -227,12 +298,12 @@ mod tests {
             assert!(!state.show_price(&event(1), settings, 0));
         }
         assert!(state.is_empty());
-        // macOS notifications being off does not hide the in-app banner.
-        let no_macos = AlertNotificationSettings {
+        // System notifications being off does not hide the in-app banner.
+        let no_system_notifications = AlertNotificationSettings {
             macos_notifications_enabled: false,
             ..Default::default()
         };
-        assert!(state.show_price(&event(1), &no_macos, 0));
+        assert!(state.show_price(&event(1), &no_system_notifications, 0));
     }
 
     #[test]

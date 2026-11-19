@@ -13,12 +13,54 @@ impl Store {
         evaluate_here: bool,
         origin: &str,
     ) -> rusqlite::Result<()> {
-        self.connection.execute(
-            "INSERT INTO price_alert_local (alert_id, evaluate_here, origin) VALUES (?1, ?2, ?3)
-             ON CONFLICT (alert_id) DO UPDATE SET evaluate_here = excluded.evaluate_here",
-            params![alert_id, evaluate_here, origin],
-        )?;
-        Ok(())
+        self.set_alert_local_at(
+            alert_id,
+            evaluate_here,
+            origin,
+            crate::model::watchlist::now_ms(),
+        )
+    }
+
+    pub(crate) fn set_alert_local_at(
+        &self,
+        alert_id: &str,
+        evaluate_here: bool,
+        origin: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let write = || {
+            self.connection.execute(
+                "INSERT INTO price_alert_local (alert_id, evaluate_here, origin) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (alert_id) DO UPDATE SET evaluate_here = excluded.evaluate_here",
+                params![alert_id, evaluate_here, origin],
+            )?;
+            Ok(())
+        };
+        let Some(id) = alert_id.strip_prefix("rectangle:") else {
+            return write();
+        };
+        let id = id
+            .parse::<std::num::NonZeroU64>()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+            .get();
+        self.in_savepoint("rectangle_watch", || {
+            let previous = self
+                .alert_local(alert_id)?
+                .is_none_or(|(enabled, _)| enabled);
+            write()?;
+            if previous != evaluate_here {
+                self.enqueue_rectangle_command(
+                    &crate::model::alert::rectangle::RectangleCommand::new(
+                        crate::model::alert::rectangle::RectangleCommandPayload::SetEvaluation {
+                            id,
+                            evaluate_here,
+                        },
+                        now_ms,
+                    ),
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn alert_local(&self, alert_id: &str) -> rusqlite::Result<Option<(bool, String)>> {

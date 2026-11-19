@@ -5,6 +5,9 @@
 
 use crate::model::alert::AlertNotificationPermission;
 use crate::model::alert::feed::day_sections;
+use crate::model::alert::rectangle::{
+    RectangleAlert, RectangleCheckpoint, RectangleMode, RectanglePhase,
+};
 use crate::model::alert::{
     AlertAsset, AlertCondition, AlertCurrency, AlertDeliveryState, AlertEventOrigin,
     AlertFrequency, AlertId, AlertRuntimeHealth, AlertServiceState, AlertState, AlertTriggerEvent,
@@ -27,16 +30,18 @@ pub enum AlertTab {
     All,
     History,
     Scripts,
+    Rectangles,
 }
 
 impl AlertTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Active,
         Self::Triggered,
         Self::Paused,
         Self::All,
         Self::History,
         Self::Scripts,
+        Self::Rectangles,
     ];
 
     pub fn title(self) -> &'static str {
@@ -47,6 +52,7 @@ impl AlertTab {
             Self::All => "All",
             Self::History => "History",
             Self::Scripts => "Scripts",
+            Self::Rectangles => "Rectangles",
         }
     }
 
@@ -57,6 +63,7 @@ impl AlertTab {
             Self::Paused => alert.state == AlertState::Paused,
             Self::All => true,
             Self::History | Self::Scripts => false,
+            Self::Rectangles => false,
         }
     }
 }
@@ -87,11 +94,18 @@ pub enum AlertCenterAction {
     /// Choose which webhook endpoints a script alert also posts to.
     EditScriptWebhooks(u64),
     OpenPineStudio,
+    EditRectangle(u64),
+    ToggleRectangle(u64),
+    DeleteRectangle(u64),
+    SetRectangleEvaluation(u64, bool),
 }
 
 pub struct AlertCenterInput<'a> {
     pub load_error: Option<&'a str>,
     pub alerts: &'a [PriceAlert],
+    pub rectangle_alerts: &'a [RectangleAlert],
+    pub rectangle_checkpoints: &'a [RectangleCheckpoint],
+    pub rectangle_muted: &'a std::collections::HashSet<u64>,
     pub history: &'a [AlertTriggerEvent],
     pub health: &'a AlertRuntimeHealth,
     /// By asset key (`AlertAsset::key`).
@@ -112,6 +126,7 @@ pub struct AlertCenterState {
     pub tab: AlertTab,
     pub search: String,
     pending_delete: Option<AlertId>,
+    pending_rectangle_delete: Option<u64>,
     confirming_clear: bool,
 }
 
@@ -158,6 +173,7 @@ pub fn tab_count(tab: AlertTab, input: &AlertCenterInput) -> usize {
     match tab {
         AlertTab::History => input.history.len(),
         AlertTab::Scripts => input.script_alerts.len(),
+        AlertTab::Rectangles => input.rectangle_alerts.len(),
         _ => input
             .alerts
             .iter()
@@ -385,6 +401,10 @@ pub fn empty_message(
             "No Script Alerts",
             "Alerts raised by your Pine scripts appear here.",
         ),
+        AlertTab::Rectangles => (
+            "No Rectangle Alerts",
+            "Draw a rectangle, right-click it, and choose Create rectangle alert.",
+        ),
     }
 }
 
@@ -404,6 +424,7 @@ impl AlertTab {
             Self::All => Icon::List,
             Self::History => Icon::ClockArrow,
             Self::Scripts => Icon::AngleBrackets,
+            Self::Rectangles => Icon::ShapeRectangle,
         }
     }
 
@@ -415,6 +436,7 @@ impl AlertTab {
             Self::All => Icon::Bell,
             Self::History => Icon::ClockArrow,
             Self::Scripts => Icon::AngleBrackets,
+            Self::Rectangles => Icon::ShapeRectangle,
         }
     }
 }
@@ -452,10 +474,14 @@ pub fn show(
         AlertTab::Scripts => {
             script_list::view(ui, &state.search, input.script_alerts, &mut actions);
         }
+        AlertTab::Rectangles => {
+            rectangle_alerts_view(ui, state, input, &mut actions);
+        }
         tab => rules_view(ui, state, input, tab, &mut actions),
     }
 
     delete_dialog(ui.ctx(), state, input, &mut actions);
+    rectangle_delete_dialog(ui.ctx(), state, input, &mut actions);
     clear_dialog(ui.ctx(), state, &mut actions);
     actions
 }
@@ -516,9 +542,18 @@ fn header(
             theme::text_primary(),
             width,
         );
+        let detail_text = if input.alerts.is_empty() && !input.rectangle_alerts.is_empty() {
+            let count = input.rectangle_alerts.len();
+            format!(
+                "{count} rectangle alert{}",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            summary(input.alerts)
+        };
         let detail = kit::galley(
             ui,
-            &summary(input.alerts),
+            &detail_text,
             kit::size::SUBHEADLINE + 1.0,
             kit::REGULAR,
             theme::text_secondary(),
@@ -782,6 +817,327 @@ fn condition_chip_parts(chip: &(&'static str, String, Option<bool>)) -> (Icon, C
         None => theme::text_secondary(),
     };
     (icon, tint)
+}
+
+fn rectangle_alerts_view(
+    ui: &mut egui::Ui,
+    state: &mut AlertCenterState,
+    input: &AlertCenterInput,
+    actions: &mut Vec<AlertCenterAction>,
+) {
+    let alerts: Vec<&RectangleAlert> = input
+        .rectangle_alerts
+        .iter()
+        .filter(|alert| matches_search(&alert.asset, &state.search))
+        .collect();
+    if alerts.is_empty() {
+        empty_page(
+            ui,
+            AlertTab::Rectangles,
+            &state.search,
+            !input.rectangle_alerts.is_empty(),
+            ui.available_height(),
+        );
+        return;
+    }
+    let height = ui.available_height();
+    card_scroll(ui, height, |ui| {
+        for alert in alerts {
+            rectangle_alert_row(ui, state, input, alert, actions);
+        }
+    });
+}
+
+fn rectangle_alert_row(
+    ui: &mut egui::Ui,
+    state: &mut AlertCenterState,
+    input: &AlertCenterInput,
+    alert: &RectangleAlert,
+    actions: &mut Vec<AlertCenterAction>,
+) {
+    let (rect, response) = card(ui, Id::new(("rectangle-alert-card", alert.id)));
+    let hovered = ui.rect_contains_pointer(rect);
+    let checkpoint = input
+        .rectangle_checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == alert.id);
+    let phase = checkpoint
+        .map(|checkpoint| checkpoint.phase)
+        .unwrap_or_else(|| RectangleCheckpoint::new(alert, input.now_ms).phase);
+    let muted = input.rectangle_muted.contains(&alert.id);
+    let supported = alert.mode == RectangleMode::LiveTouch;
+    let not_watching = supported
+        && input.sync_enabled
+        && muted
+        && matches!(
+            phase,
+            RectanglePhase::Scheduled | RectanglePhase::Active | RectanglePhase::Paused
+        );
+    let (status, tone) = if !supported {
+        ("Unsupported", Tone::Bad)
+    } else if not_watching {
+        ("Not watching here", Tone::Neutral)
+    } else {
+        rectangle_status(phase)
+    };
+    let status_help = if !supported {
+        "This trigger mode is not evaluated by this version."
+    } else if not_watching {
+        "This synced rectangle is not watched on this device. Choose Watch on This Mac to enable it here."
+    } else {
+        rectangle_status_help(phase)
+    };
+    let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    if phase == RectanglePhase::Paused {
+        row.multiply_opacity(0.7);
+    }
+    let ui = &mut row;
+
+    let icon = icon_rect(rect);
+    icons::paint(ui.painter(), icon, Icon::Bell, theme::text_secondary());
+
+    let mut right = rect.right() - 14.0;
+    let more = Rect::from_min_size(
+        Pos2::new(right - 26.0, rect.center().y - 13.0),
+        Vec2::splat(26.0),
+    );
+    let toggleable = supported
+        && matches!(
+            phase,
+            RectanglePhase::Scheduled | RectanglePhase::Active | RectanglePhase::Paused
+        );
+    let mut labels = vec!["Edit\u{2026}"];
+    if toggleable {
+        labels.push(if phase == RectanglePhase::Paused {
+            "Resume"
+        } else {
+            "Pause"
+        });
+        if input.sync_enabled && supported {
+            labels.push(if muted {
+                "Watch on This Mac"
+            } else {
+                "Stop Watching on This Mac"
+            });
+        }
+    }
+    labels.push("Delete\u{2026}");
+    more_button(
+        ui,
+        more,
+        Id::new(("rectangle-alert-more", alert.id)),
+        &labels,
+        |ui| rectangle_alert_menu(ui, state, input, alert, phase, actions),
+    );
+
+    let toggle_rect = more.translate(Vec2::new(-28.0, 0.0));
+    let (toggle_icon, toggle_text, toggle_action, toggle_enabled) =
+        if input.sync_enabled && supported {
+            (
+                if muted { Icon::Eye } else { Icon::EyeSlash },
+                if muted {
+                    "Watch on This Mac"
+                } else {
+                    "Stop Watching on This Mac"
+                },
+                AlertCenterAction::SetRectangleEvaluation(alert.id, muted),
+                matches!(
+                    phase,
+                    RectanglePhase::Scheduled | RectanglePhase::Active | RectanglePhase::Paused
+                ),
+            )
+        } else {
+            (
+                if phase == RectanglePhase::Paused {
+                    Icon::PlayFill
+                } else {
+                    Icon::PauseFill
+                },
+                if phase == RectanglePhase::Paused {
+                    "Resume"
+                } else {
+                    "Pause"
+                },
+                AlertCenterAction::ToggleRectangle(alert.id),
+                toggleable,
+            )
+        };
+    if kit::hover_button(
+        ui,
+        toggle_rect,
+        Id::new(("rectangle-alert-toggle", alert.id)),
+        toggle_icon,
+        toggle_text,
+        hovered,
+        toggle_enabled,
+    )
+    .clicked()
+    {
+        actions.push(toggle_action);
+    }
+    let edit_rect = toggle_rect.translate(Vec2::new(-28.0, 0.0));
+    if kit::hover_button(
+        ui,
+        edit_rect,
+        Id::new(("rectangle-alert-edit", alert.id)),
+        Icon::Pencil,
+        "Edit",
+        hovered,
+        true,
+    )
+    .clicked()
+    {
+        actions.push(AlertCenterAction::EditRectangle(alert.id));
+    }
+    right = edit_rect.left() - 12.0;
+    let badge = kit::paint_status_badge(ui, right, rect.center().y, status, tone);
+    let _ = ui
+        .interact(
+            badge,
+            Id::new(("rectangle-alert-status", alert.id)),
+            Sense::hover(),
+        )
+        .on_hover_text(status_help);
+
+    let left = icon.right() + 14.0;
+    let text_width = (badge.left() - 12.0 - left).max(0.0);
+    let title = kit::galley(
+        ui,
+        &format!("{} rectangle alert", alert.asset.symbol),
+        14.0,
+        kit::SEMIBOLD,
+        theme::text_primary(),
+        text_width,
+    );
+    ui.painter().galley(
+        Pos2::new(left, rect.top() + 18.0 - title.size().y / 2.0),
+        title,
+        theme::text_primary(),
+    );
+    let details = format!(
+        "{} to {} · {} until {} UTC",
+        alert.currency.format_price(alert.low),
+        alert.currency.format_price(alert.high),
+        crate::model::alert::message::timestamp(alert.start_ms),
+        crate::model::alert::message::timestamp(alert.end_ms)
+    );
+    let details_galley = kit::galley(
+        ui,
+        &details,
+        11.0,
+        kit::REGULAR,
+        theme::text_secondary(),
+        text_width,
+    );
+    ui.painter().galley(
+        Pos2::new(left, rect.top() + 40.0 - details_galley.size().y / 2.0),
+        details_galley,
+        theme::text_secondary(),
+    );
+    let response = accessibility::label(
+        response,
+        format!(
+            "{} rectangle alert, {}, {}",
+            alert.asset.symbol,
+            if not_watching {
+                "Not watching here"
+            } else {
+                status
+            },
+            details
+        ),
+    );
+    if response.double_clicked() {
+        actions.push(AlertCenterAction::EditRectangle(alert.id));
+    }
+}
+
+fn rectangle_status(phase: RectanglePhase) -> (&'static str, Tone) {
+    match phase {
+        RectanglePhase::Scheduled => ("Scheduled", Tone::Neutral),
+        RectanglePhase::Active => ("Active", Tone::Good),
+        RectanglePhase::Paused => ("Paused", Tone::Neutral),
+        RectanglePhase::Triggered => ("Triggered", Tone::Warning),
+        RectanglePhase::Expired => ("Expired", Tone::Neutral),
+    }
+}
+
+fn rectangle_status_help(phase: RectanglePhase) -> &'static str {
+    match phase {
+        RectanglePhase::Scheduled => "The alert starts when its time window opens.",
+        RectanglePhase::Active => "Watching for a fresh price to enter the rectangle.",
+        RectanglePhase::Paused => "Paused on this device.",
+        RectanglePhase::Triggered => "This once-only rectangle alert has fired.",
+        RectanglePhase::Expired => "The time window has ended.",
+    }
+}
+
+fn rectangle_alert_menu(
+    ui: &mut egui::Ui,
+    state: &mut AlertCenterState,
+    input: &AlertCenterInput,
+    alert: &RectangleAlert,
+    phase: RectanglePhase,
+    actions: &mut Vec<AlertCenterAction>,
+) {
+    if kit::menu_item(ui, Icon::Pencil, "Edit\u{2026}", true, false) {
+        actions.push(AlertCenterAction::EditRectangle(alert.id));
+        ui.close();
+    }
+    if alert.mode == RectangleMode::LiveTouch
+        && matches!(
+            phase,
+            RectanglePhase::Scheduled | RectanglePhase::Active | RectanglePhase::Paused
+        )
+        && kit::menu_item(
+            ui,
+            if phase == RectanglePhase::Paused {
+                Icon::PlayFill
+            } else {
+                Icon::PauseFill
+            },
+            if phase == RectanglePhase::Paused {
+                "Resume"
+            } else {
+                "Pause"
+            },
+            true,
+            false,
+        )
+    {
+        actions.push(AlertCenterAction::ToggleRectangle(alert.id));
+        ui.close();
+    }
+    if input.sync_enabled
+        && alert.mode == RectangleMode::LiveTouch
+        && matches!(
+            phase,
+            RectanglePhase::Scheduled | RectanglePhase::Active | RectanglePhase::Paused
+        )
+    {
+        let watching = !input.rectangle_muted.contains(&alert.id);
+        if kit::menu_item(
+            ui,
+            if watching { Icon::EyeSlash } else { Icon::Eye },
+            if watching {
+                "Stop Watching on This Mac"
+            } else {
+                "Watch on This Mac"
+            },
+            true,
+            false,
+        ) {
+            actions.push(AlertCenterAction::SetRectangleEvaluation(
+                alert.id, !watching,
+            ));
+            ui.close();
+        }
+    }
+    kit::menu_separator(ui);
+    if kit::menu_item(ui, Icon::Trash, "Delete\u{2026}", true, true) {
+        state.pending_rectangle_delete = Some(alert.id);
+        ui.close();
+    }
 }
 
 fn rules_view(
@@ -1252,6 +1608,42 @@ fn delete_dialog(
     }
 }
 
+fn rectangle_delete_dialog(
+    ctx: &egui::Context,
+    state: &mut AlertCenterState,
+    input: &AlertCenterInput,
+    actions: &mut Vec<AlertCenterAction>,
+) {
+    let Some(id) = state.pending_rectangle_delete else {
+        return;
+    };
+    let Some(alert) = input.rectangle_alerts.iter().find(|alert| alert.id == id) else {
+        state.pending_rectangle_delete = None;
+        return;
+    };
+    let message = format!(
+        "The {} rectangle alert will be removed. Its ordinary chart drawing is unchanged.",
+        alert.asset.symbol
+    );
+    match kit::confirm(
+        ctx,
+        Id::new("rectangle-alert-delete"),
+        &kit::Confirm {
+            icon: Icon::Trash,
+            title: "Delete this rectangle alert?",
+            message: &message,
+            destructive: "Delete",
+        },
+    ) {
+        Some(kit::ConfirmOutcome::Confirmed) => {
+            actions.push(AlertCenterAction::DeleteRectangle(id));
+            state.pending_rectangle_delete = None;
+        }
+        Some(kit::ConfirmOutcome::Cancelled) => state.pending_rectangle_delete = None,
+        None => {}
+    }
+}
+
 fn clear_dialog(
     ctx: &egui::Context,
     state: &mut AlertCenterState,
@@ -1331,6 +1723,9 @@ mod tests {
         AlertCenterInput {
             load_error: None,
             alerts,
+            rectangle_alerts: &[],
+            rectangle_checkpoints: &[],
+            rectangle_muted: &NO_MUTED,
             history,
             health,
             quote: &|_| None,
@@ -1373,6 +1768,25 @@ mod tests {
         assert_eq!(symbols(AlertTab::All), ["ETH", "SOL", "BTC", "XRP"]);
         assert!(symbols(AlertTab::History).is_empty());
         assert!(symbols(AlertTab::Scripts).is_empty());
+    }
+
+    #[test]
+    fn the_rectangle_tab_counts_and_labels_saved_zones_independently() {
+        let alert =
+            RectangleAlert::new_live_touch(asset("BTC", "Bitcoin"), 1_000, 2_000, 10.0, 20.0, 900)
+                .unwrap();
+        let checkpoint = RectangleCheckpoint::new(&alert, 1_500);
+        let health = AlertRuntimeHealth::default();
+        let mut input = input(&[], &[], &health);
+        input.rectangle_alerts = std::slice::from_ref(&alert);
+        input.rectangle_checkpoints = std::slice::from_ref(&checkpoint);
+
+        assert_eq!(tab_count(AlertTab::Rectangles, &input), 1);
+        assert_eq!(rectangle_status(checkpoint.phase), ("Active", Tone::Good));
+        assert_eq!(
+            empty_message(AlertTab::Rectangles, false, false).0,
+            "No Rectangle Alerts"
+        );
     }
 
     #[test]
@@ -1519,7 +1933,10 @@ mod tests {
             "Falls 2.5%"
         );
         assert_eq!(
-            condition_chip(&AlertCondition::Unsupported { tag: "x".into() }).2,
+            condition_chip(&AlertCondition::Unsupported {
+                payload: serde_json::json!({"tag": "x"})
+            })
+            .2,
             None
         );
         assert_eq!(crossed_chip(101.0, 100.0).1, "Crossed above");

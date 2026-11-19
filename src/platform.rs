@@ -2,6 +2,9 @@
 //! on the machine it runs on instead of hard-coding macOS. Key combinations live in
 //! `ui::shortcut`.
 
+/// Stable product identity used by window systems, launchers, and native notifications.
+pub const APPLICATION_ID: &str = "es.nico.degenview";
+
 /// "in your Keychain" / "in secure storage".
 pub const fn in_secret_store() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -83,8 +86,13 @@ pub const fn has_file_dialogs() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
-/// Whether the background alert agent, Login Items and the macOS notification centre exist.
+/// Whether this platform can deliver system notifications for alerts.
 pub const fn has_system_notifications() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+/// Whether system alert evaluation continues after the main window closes.
+pub const fn has_background_alert_agent() -> bool {
     cfg!(target_os = "macos")
 }
 
@@ -126,7 +134,7 @@ mod tests {
         } else if cfg!(windows) {
             assert_eq!(in_secret_store(), "in Windows Credential Manager");
             assert_ne!(file_manager(), "Finder");
-            assert!(!has_system_notifications());
+            assert!(has_system_notifications());
         } else {
             assert_eq!(in_secret_store(), "in secure storage");
             assert_ne!(file_manager(), "Finder");

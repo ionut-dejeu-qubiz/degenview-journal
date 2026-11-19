@@ -347,8 +347,9 @@ names never match it (test-pinned, both CPUs).
   (startup, beside `cleanup_stale`) rewrites `DisplayVersion`, only when Inno's `App Path` is this
   exe's folder (portable copies never touch an install's entry). Missing key = portable, ignored.
 - **Installs** `degenview.exe` (always, `ignoreversion`: no version resource), OFL font licences in
-  `licenses\`, Start menu shortcut, optional desktop one (off), GPL licence page, launch-after-install
-  box (not in silent installs). `CloseApplications` asks a running DegenView to close.
+  `licenses\`, Start menu shortcut with the `es.nico.degenview` toast-notification identity, optional
+  desktop one (off), GPL licence page, launch-after-install box (not in silent installs).
+  `CloseApplications` asks a running DegenView to close.
 - **Uninstall** removes the app folder (incl. `.DegenView-update`) and shortcuts; **keeps** user data
   (`%APPDATA%\es.nico.degenview`) and cache.
 - **CI.** `windows-installer-check.yml` builds around a stub exe on PRs touching it, silent install,

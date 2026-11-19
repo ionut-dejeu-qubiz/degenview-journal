@@ -10,6 +10,7 @@ pub mod line;
 pub mod message;
 pub mod notification;
 pub mod pine;
+pub mod rectangle;
 
 use crate::model::watchlist::new_id;
 use crate::model::{DataSource, InstrumentId};
@@ -55,9 +56,9 @@ pub enum AlertCondition {
         reference: f64,
         target: f64,
     },
-    /// A condition written by a newer version; kept so the row survives a round trip.
+    /// An unknown or incomplete condition, preserved until a version can evaluate it.
     Unsupported {
-        tag: String,
+        payload: serde_json::Value,
     },
 }
 
@@ -138,7 +139,7 @@ impl Serialize for AlertCondition {
                 reference,
                 target,
             } => raw("fallsBy", Some(*target), Some(*percent), Some(*reference)),
-            Self::Unsupported { tag } => raw(tag, None, None, None),
+            Self::Unsupported { payload } => return payload.serialize(serializer),
         }
         .serialize(serializer)
     }
@@ -146,7 +147,16 @@ impl Serialize for AlertCondition {
 
 impl<'de> Deserialize<'de> for AlertCondition {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = RawCondition::deserialize(deserializer)?;
+        let payload = serde_json::Value::deserialize(deserializer)?;
+        let tag = payload
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("alert condition has no string tag"))?;
+        if !matches!(tag, "crossesAbove" | "crossesBelow" | "risesBy" | "fallsBy") {
+            return Ok(Self::Unsupported { payload });
+        }
+        let raw: RawCondition =
+            serde_json::from_value(payload.clone()).map_err(serde::de::Error::custom)?;
         // A known tag missing a required field is as unusable as an unknown tag.
         let known = match raw.tag.as_str() {
             "crossesAbove" => raw.target.map(|target| Self::CrossesAbove { target }),
@@ -169,7 +179,7 @@ impl<'de> Deserialize<'de> for AlertCondition {
             },
             _ => None,
         };
-        Ok(known.unwrap_or(Self::Unsupported { tag: raw.tag }))
+        Ok(known.unwrap_or(Self::Unsupported { payload }))
     }
 }
 
@@ -518,6 +528,8 @@ pub struct AlertNotificationSettings {
     pub delivery_enabled: bool,
     pub sound_enabled: bool,
     pub in_app_banners_enabled: bool,
+    /// Kept as `macos_notifications_enabled` for persisted-state compatibility; controls system
+    /// notifications on every platform that supports them.
     pub macos_notifications_enabled: bool,
 }
 
@@ -584,6 +596,7 @@ pub struct AlertRuntimeHealth {
     pub notification_permission: AlertNotificationPermission,
     pub providers: Vec<AlertProviderHealth>,
     pub unreconciled_gaps: Vec<String>,
+    pub rectangle_error: Option<String>,
 }
 
 /// Everything the alert runtime persists, written whole with a rising revision.
@@ -692,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn conditions_round_trip_and_unknown_tags_survive() {
+    fn conditions_round_trip_and_unknown_payloads_survive() {
         let conditions = [
             AlertCondition::CrossesAbove { target: 100.0 },
             AlertCondition::CrossesBelow { target: 90.5 },
@@ -707,28 +720,33 @@ mod tests {
                 condition
             );
         }
-        let future: AlertCondition =
-            serde_json::from_str(r#"{"tag":"touchesVwap","target":1}"#).unwrap();
+        let payload = serde_json::json!({
+            "tag": "rectangle",
+            "start_ms": 1000,
+            "target": {"low": 10, "high": 20},
+            "modes": ["touch", "close"]
+        });
+        let future: AlertCondition = serde_json::from_value(payload.clone()).unwrap();
         assert_eq!(
             future,
             AlertCondition::Unsupported {
-                tag: "touchesVwap".into()
+                payload: payload.clone()
             }
         );
         assert_eq!(future.target(), None);
-        // The tag is preserved on the way back out.
-        assert_eq!(
-            serde_json::to_string(&future).unwrap(),
-            r#"{"tag":"touchesVwap"}"#
-        );
+        assert_eq!(serde_json::to_value(&future).unwrap(), payload);
         // A known tag missing its fields is unusable, not a decode failure.
         let broken: AlertCondition =
             serde_json::from_str(r#"{"tag":"risesBy","target":1}"#).unwrap();
         assert_eq!(
             broken,
             AlertCondition::Unsupported {
-                tag: "risesBy".into()
+                payload: serde_json::json!({"tag": "risesBy", "target": 1})
             }
+        );
+        assert_eq!(
+            serde_json::to_value(&broken).unwrap(),
+            serde_json::json!({"tag": "risesBy", "target": 1})
         );
     }
 
@@ -755,7 +773,10 @@ mod tests {
         assert_eq!(below.is_armed_at(101.0), Some(true));
         assert_eq!(below.is_armed_at(100.0), Some(false));
         assert_eq!(
-            AlertCondition::Unsupported { tag: "x".into() }.is_armed_at(1.0),
+            AlertCondition::Unsupported {
+                payload: serde_json::json!({"tag": "x"})
+            }
+            .is_armed_at(1.0),
             None
         );
     }

@@ -3,13 +3,80 @@
 //! fields.
 
 use super::{
-    EntityKind, EntityLink, OutboxOp, Outcome, RemoteRecord, Side, Stamp, Work, canonical_json,
-    merge, sha256_hex,
+    EntityKind, EntityLink, LOCAL_UNREADABLE, NEWER_SCHEMA, OutboxOp, Outcome, RECTANGLE_BUSY,
+    RemoteRecord, Side, Stamp, Work, canonical_json, merge, sha256_hex,
 };
 use crate::sync::engine::SyncError;
 use serde_json::{Map, Value};
 
 impl Work<'_> {
+    pub(super) fn apply_rectangle_alert(&mut self, record: &RemoteRecord) -> Result<(), SyncError> {
+        use crate::model::alert::rectangle::{
+            RectangleAlert, RectangleCommand, RectangleCommandPayload,
+        };
+        let id = record.record.name.id.as_str();
+        if record
+            .value
+            .get("format_version")
+            .and_then(Value::as_u64)
+            .is_some_and(|version| version > 1)
+        {
+            return self.keep(record, NEWER_SCHEMA);
+        }
+        if self.store.rectangle_commands_pending()? {
+            return self.keep(record, RECTANGLE_BUSY);
+        }
+        if !self.table_writable("rectangle_alert")? {
+            return self.keep(record, LOCAL_UNREADABLE);
+        }
+        let kind = EntityKind::RectangleAlert;
+        let remote_hash = sha256_hex(&canonical_json(&record.value));
+        let meta = self.store.entity_meta(kind, id)?;
+        let local = self.find_local(kind, id)?;
+        let Some(target) = self.merged_value(record, kind, id, meta.as_ref(), local.as_ref())?
+        else {
+            return Ok(());
+        };
+        let Ok(alert) = serde_json::from_value::<RectangleAlert>(target) else {
+            return self.keep(record, "invalid");
+        };
+        if alert.id.to_string() != id {
+            return self.keep(record, "invalid");
+        }
+        if local
+            .as_ref()
+            .is_none_or(|current| current.hash != remote_hash)
+        {
+            self.store
+                .enqueue_rectangle_command(&RectangleCommand::new(
+                    RectangleCommandPayload::Save(Box::new(alert)),
+                    self.ctx.now_ms,
+                ))?;
+            if local.is_none() {
+                self.store.set_alert_local_at(
+                    &format!("rectangle:{id}"),
+                    false,
+                    "remote",
+                    self.ctx.now_ms,
+                )?;
+            }
+            self.report.alert_commands += 1;
+            self.report.applied += 1;
+        }
+        self.store.link_entity(&EntityLink {
+            kind,
+            sync_id: id.to_string(),
+            local_id: id.to_string(),
+            synced_hash: remote_hash,
+            system_fields: record.system_fields.clone(),
+            base_payload: None,
+            revision: record.record.revision as i64,
+            origin_device: record.record.origin_device.clone(),
+            now_ms: self.ctx.now_ms,
+        })?;
+        Ok(())
+    }
+
     /// Alerts are owned by whichever process runs evaluation (the app or the background agent),
     /// which holds the live list in memory and rewrites it. A table write from here would be
     /// overwritten, so remote changes go through the same command queue as the UI.
