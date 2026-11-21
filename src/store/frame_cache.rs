@@ -8,9 +8,12 @@
 //! writer can be forgotten, at the cost of one rebuild per write.
 
 use super::Store;
+use crate::model::Timeframe;
 use crate::model::alert::pine::PineAlertSubscription;
 use crate::model::alert::rectangle::{RectangleAlert, RectangleCheckpoint, RectangleLiveEvent};
+use crate::model::drawings::favorites::{BarPrefs, Favorite};
 use crate::model::webhook::WebhookEndpoint;
+use crate::service::net::proxy::ProxyConfig;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -107,6 +110,15 @@ pub(crate) struct FrameCaches {
     rectangle_events: ChangeCached<Result<Vec<RectangleLiveEvent>, String>>,
     /// `(delivered, attempted)` per alert event, for the Alerts window's history chips.
     webhook_summaries: ChangeCachedMap<u64, Option<(usize, usize)>>,
+    /// The timeframe picker's pinned list, which every chart toolbar and Pine Studio bar shows.
+    pinned_timeframes: ChangeCached<Vec<Timeframe>>,
+    /// The `net.proxy` setting the Settings window's Network page shows.
+    proxy_config: ChangeCached<ProxyConfig>,
+    /// The starred drawing tools and cursors, which every flyout row, the cursor menu and the
+    /// favorites bar show.
+    drawing_favorites: ChangeCached<Vec<Favorite>>,
+    /// The favorites bar's place and hidden flag.
+    favorites_bar: ChangeCached<BarPrefs>,
 }
 
 impl Store {
@@ -204,6 +216,34 @@ impl Store {
         }
     }
 
+    /// `pinned_timeframes`, read again only after a write.
+    pub fn pinned_timeframes_cached(&self) -> Arc<Vec<Timeframe>> {
+        self.frame_caches
+            .pinned_timeframes
+            .get(self.change_stamp(), || self.pinned_timeframes())
+    }
+
+    /// `drawing_favorites`, read again only after a write.
+    pub fn drawing_favorites_cached(&self) -> Arc<Vec<Favorite>> {
+        self.frame_caches
+            .drawing_favorites
+            .get(self.change_stamp(), || self.drawing_favorites())
+    }
+
+    /// `favorites_bar`, read again only after a write.
+    pub fn favorites_bar_cached(&self) -> Arc<BarPrefs> {
+        self.frame_caches
+            .favorites_bar
+            .get(self.change_stamp(), || self.favorites_bar())
+    }
+
+    /// The saved proxy setting (`ProxyConfig::load`), read again only after a write.
+    pub fn proxy_config_cached(&self) -> Arc<ProxyConfig> {
+        self.frame_caches
+            .proxy_config
+            .get(self.change_stamp(), || ProxyConfig::load(self))
+    }
+
     /// How many of `event_id`'s webhook deliveries arrived, of how many were attempted; `None`
     /// when it posted to none. Kept per event until the next write.
     pub fn webhook_delivery_summary(&self, event_id: u64) -> Option<(usize, usize)> {
@@ -274,7 +314,7 @@ mod tests {
         let view = SavedView {
             id: 8,
             name: "From another Mac".into(),
-            timeframe: Timeframe::Hour,
+            timeframe: Timeframe::HOUR_1,
             created_at_ms: 1_000,
             charts: Vec::new(),
             columns: None,

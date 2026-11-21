@@ -9,8 +9,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::fast_hash::FastMap;
+use super::security_slice;
 use super::session::Session;
-use super::state::{RuntimeState, SecuritySite};
+use super::state::{LoggedBar, RuntimeState, SecuritySite};
 use super::support::{ChartSpan, SecurityKey};
 use super::types::{BarFlags, RuntimeContext};
 use super::value::{RefKind, RuntimeValue};
@@ -20,12 +22,20 @@ use crate::pine::logs::LogRequest;
 use crate::pine::syntax::ast::{Argument, Expression, Statement};
 use crate::pine::syntax::token::{Diagnostic, DiagnosticCategory, SourceRange};
 use crate::pine::time;
-use crate::pine::time::calendar;
-
-const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// How many `request.*` expressions may contain one another.
 const SECURITY_NESTING_LIMIT: usize = 3;
+
+/// A chart bar (or a candle of the enclosing request) a call site takes in. `skipped_after` is set
+/// for a bar the site was not called on, replayed later: how many logged bars came after it.
+#[derive(Clone, Copy)]
+struct Step<'a> {
+    bar: &'a Kline,
+    seconds: f64,
+    confirmed: bool,
+    realtime: bool,
+    skipped_after: Option<usize>,
+}
 
 /// One `request.security` call's resolved arguments. `foreign` holds another symbol's series; it is
 /// None for the chart's own symbol.
@@ -469,7 +479,7 @@ impl Session {
             return Ok(());
         };
         for candle in candles.iter() {
-            if bucket_end(candle.open_time, request.interval) > before {
+            if time::bucket::end(candle.open_time, request.interval) > before {
                 break;
             }
             site.last_result = self.evaluate_higher_timeframe(site, candle, request, true)?;
@@ -494,17 +504,129 @@ impl Session {
             return Ok(result);
         }
         if !state.is_warmed_up {
-            self.warm_up(&mut state, request, bar.open_time)?;
+            // History from before the chart's first bar; the chart's own bars, the ones this site
+            // was not called on included, are replayed below.
+            let before = self
+                .series_bars
+                .first()
+                .map_or(bar.open_time, |first| first.bar.open_time);
+            self.warm_up(&mut state, request, before)?;
         }
-        let start = bucket_start(bar.open_time, request.interval);
+        self.replay_skipped_bars(&mut state, request, bar.open_time)?;
+        let seconds = self.bar_seconds;
+        let (result, fresh) = self.advance_site(
+            &mut state,
+            request,
+            &Step {
+                bar: &bar,
+                seconds,
+                confirmed: context.flags.is_confirmed,
+                realtime: context.flags.is_realtime,
+                skipped_after: None,
+            },
+        )?;
+        let result = if request.gaps_on && !fresh {
+            RuntimeValue::Na
+        } else {
+            result
+        };
+        state.processed_bar = Some(bar.open_time);
+        state.bar_result = result.clone();
+        self.working.securities.insert(key, state);
+        Ok(result)
+    }
+
+    /// Takes the confirmed bars of the running series (the chart's, or the candles of the request
+    /// this one sits in) before `before` that this site was not called on into its
+    /// higher-timeframe candle, as TradingView evaluates the expression on every bar whether or not
+    /// the call runs: a call under a condition sees the same candles and builds the same history as
+    /// one that always runs.
+    fn replay_skipped_bars(
+        &mut self,
+        state: &mut SecuritySite,
+        request: &SecurityRequest,
+        before: i64,
+    ) -> Result<(), Diagnostic> {
+        let start = state.processed_bar.map_or(0, |seen| {
+            self.series_bars
+                .partition_point(|logged| logged.bar.open_time <= seen)
+        });
+        let end = self
+            .series_bars
+            .partition_point(|logged| logged.bar.open_time < before);
+        for index in start..end {
+            let LoggedBar { bar, seconds } = self.series_bars[index].clone();
+            let skipped_after = self.series_bars.len() - 1 - index;
+            self.advance_site(
+                state,
+                request,
+                &Step {
+                    bar: &bar,
+                    seconds,
+                    confirmed: true,
+                    realtime: false,
+                    skipped_after: Some(skipped_after),
+                },
+            )?;
+            state.processed_bar = Some(bar.open_time);
+        }
+        Ok(())
+    }
+
+    /// The chart variables (those the expression reads through `security_globals`) as they stood on
+    /// the confirmed bar `back` bars before the latest one, from their histories. A variable that did
+    /// not exist yet is `na`. The values are the ones the bar ended with, so a variable assigned
+    /// after the request in the script reads one bar fresher than a call that ran there would see.
+    fn variables_as_of(&self, back: usize) -> FastMap<String, RuntimeValue> {
+        self.working
+            .variables
+            .keys()
+            .map(|name| {
+                let value = self
+                    .working
+                    .histories
+                    .get(name)
+                    .and_then(|history| {
+                        history
+                            .len()
+                            .checked_sub(back + 1)
+                            .and_then(|at| history.get(at))
+                    })
+                    .cloned()
+                    .unwrap_or(RuntimeValue::Na);
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// Takes `step`'s bar into the site's candle. Returns the expression's value for the bar and
+    /// whether a higher-timeframe bar was completed on it. A replayed bar (`skipped_after` is set)
+    /// only keeps the site's state current: nothing is evaluated for the bar itself, and a candle it
+    /// completes is evaluated with the chart variables of that bar.
+    fn advance_site(
+        &mut self,
+        state: &mut SecuritySite,
+        request: &SecurityRequest,
+        step: &Step<'_>,
+    ) -> Result<(RuntimeValue, bool), Diagnostic> {
+        let Step {
+            bar,
+            seconds,
+            confirmed,
+            realtime,
+            skipped_after,
+        } = *step;
+        let replay = skipped_after.is_some();
+        let start = time::bucket::start(bar.open_time, request.interval);
         let mut fresh = false;
         if state.bucket != Some(start) {
             // The chart skipped the bucket's last bar, so complete it now.
             if state.has_pending_bars
                 && let Some(pending) = state.accumulated.clone()
             {
+                self.replay_globals = skipped_after.map(|back| self.variables_as_of(back));
                 state.last_result =
-                    self.evaluate_higher_timeframe(&mut state, &pending, request, true)?;
+                    self.evaluate_higher_timeframe(state, &pending, request, true)?;
                 fresh = true;
             }
             state.bucket = Some(start);
@@ -517,13 +639,13 @@ impl Session {
         }
         developing.push(bar.clone());
         let developing = fold_one(&developing, request.interval);
-        let end = bucket_end(start, request.interval);
-        let closes_bucket = bar.open_time + (self.bar_seconds * 1000.0).round() as i64 >= end;
-        let confirmed = context.flags.is_confirmed;
+        let end = time::bucket::end(start, request.interval);
+        let closes_bucket = bar.open_time + (seconds * 1000.0).round() as i64 >= end;
 
         let result;
         if closes_bucket && confirmed {
-            result = self.evaluate_higher_timeframe(&mut state, &developing, request, true)?;
+            self.replay_globals = skipped_after.map(|back| self.variables_as_of(back));
+            result = self.evaluate_higher_timeframe(state, &developing, request, true)?;
             state.last_result = result.clone();
             state.accumulated = None;
             state.has_pending_bars = false;
@@ -533,21 +655,13 @@ impl Session {
                 state.accumulated = Some(developing.clone());
                 state.has_pending_bars = true;
             }
-            if request.lookahead_on || context.flags.is_realtime {
-                result = self.evaluate_higher_timeframe(&mut state, &developing, request, false)?;
+            if !replay && (request.lookahead_on || realtime) {
+                result = self.evaluate_higher_timeframe(state, &developing, request, false)?;
             } else {
                 result = state.last_result.clone();
             }
         }
-        let result = if request.gaps_on && !fresh {
-            RuntimeValue::Na
-        } else {
-            result
-        };
-        state.processed_bar = Some(bar.open_time);
-        state.bar_result = result.clone();
-        self.working.securities.insert(key, state);
-        Ok(result)
+        Ok((result, fresh))
     }
 
     /// `request.security` for a symbol the chart does not carry, from the provider's snapshot.
@@ -571,7 +685,7 @@ impl Session {
             let chart_close = bar.open_time + (self.bar_seconds * 1000.0).round() as i64;
             while state.completed_candles < candles.len() {
                 let candle = &candles[state.completed_candles];
-                if bucket_end(candle.open_time, request.interval) > chart_close {
+                if time::bucket::end(candle.open_time, request.interval) > chart_close {
                     break;
                 }
                 state.last_result =
@@ -720,10 +834,19 @@ impl Session {
             (*site.state).clone()
         };
         let mut chart = std::mem::replace(&mut self.working, site_state);
-        // The chart's variables stay readable from the expression, without a copy of the table.
+        // The series the expression runs on is this site's own candles, which a request inside it
+        // replays; the enclosing series is put back below.
+        let outer_series = std::mem::replace(&mut self.series_bars, std::mem::take(&mut site.bars));
+        // The chart's variables stay readable from the expression, without a copy of the table. A
+        // replayed candle reads their values as of its bar instead, which are a copy.
+        let replayed_globals = self.replay_globals.take();
+        let replayed = replayed_globals.is_some();
         let outer_globals = self
             .security_globals
-            .replace(std::mem::take(&mut chart.variables));
+            .replace(replayed_globals.unwrap_or_else(|| std::mem::take(&mut chart.variables)));
+        // `varip` values are the chart's: the request keeps its own (empty: a `varip` there acts
+        // like `var`, which the declaration reads from the site's variables).
+        let outer_intrabar = std::mem::take(&mut self.intrabar);
         self.working.instructions = 0;
         self.working.bar_index += 1;
         self.bar_seconds = request.interval;
@@ -751,7 +874,16 @@ impl Session {
             self.debug_enter_security(&requested.symbol, requested.interval_seconds);
         }
         self.logs.enter_request(requested, candle.open_time, commit);
-        let evaluated = self.eval(&request.expression, &mut security_context);
+        // The script variables the expression reads are computed on this series, not read off the chart.
+        let slice = self
+            .security_slices
+            .get(&security_slice::key(&request.expression))
+            .cloned();
+        let evaluated = match slice {
+            Some(slice) => self.run(&slice, &mut security_context).map(|_| ()),
+            None => Ok(()),
+        }
+        .and_then(|()| self.eval(&request.expression, &mut security_context));
         self.logs.leave_request();
         if debugging {
             self.debug_leave();
@@ -765,8 +897,19 @@ impl Session {
             }
             *site.state = std::mem::take(&mut self.working);
         }
-        chart.variables =
+        site.bars = std::mem::replace(&mut self.series_bars, outer_series);
+        if commit && value.is_ok() {
+            site.bars.push(LoggedBar {
+                bar: candle.clone(),
+                seconds: request.interval,
+            });
+        }
+        let globals =
             std::mem::replace(&mut self.security_globals, outer_globals).unwrap_or_default();
+        if !replayed {
+            chart.variables = globals;
+        }
+        self.intrabar = outer_intrabar;
         self.working = chart;
         self.bar_seconds = chart_bar_seconds;
         self.chart_bar_seconds = outer_chart_seconds;
@@ -811,51 +954,17 @@ fn unserved_symbol_message(name: &str) -> String {
     }
 }
 
-/// The start of the calendar bucket that contains `open_time`, for a bar length in seconds.
-pub(in crate::pine) fn bucket_start(open_time: i64, interval_seconds: f64) -> i64 {
-    if interval_seconds < 604_800.0 {
-        let ms = (interval_seconds * 1000.0).round() as i64;
-        return open_time.div_euclid(ms) * ms;
-    }
-    let components = calendar::components(open_time);
-    if interval_seconds < 2_419_200.0 {
-        // A week: Monday 00:00 UTC (Pine's `dayofweek` is Sunday = 1 … Saturday = 7).
-        let days = open_time.div_euclid(MILLIS_PER_DAY);
-        let days_back = (components.weekday - 2).rem_euclid(7);
-        (days - days_back) * MILLIS_PER_DAY
-    } else {
-        // A month (and coarser): the first of the month 00:00 UTC.
-        calendar::make(components.year, components.month, 1, 0, 0, 0, 0).unwrap_or(open_time)
-    }
-}
-
-/// End of the bucket that opens at `start`.
-pub(in crate::pine) fn bucket_end(start: i64, interval_seconds: f64) -> i64 {
-    if interval_seconds >= 2_419_200.0 {
-        let later = start + (interval_seconds * 1.2 * 1000.0).round() as i64;
-        bucket_start(later, interval_seconds)
-    } else {
-        start + (interval_seconds * 1000.0).round() as i64
-    }
-}
-
-/// Folds candles (which share one bucket) into a single higher-timeframe candle.
+/// Folds candles (which share one bucket) into a single higher-timeframe candle, closing where the
+/// bucket ends.
 fn fold_one(candles: &[Kline], interval_seconds: f64) -> Kline {
-    let start = bucket_start(candles[0].open_time, interval_seconds);
+    let start = time::bucket::start(candles[0].open_time, interval_seconds);
     let mut folded = Kline {
         open_time: start,
-        close_time: bucket_end(start, interval_seconds),
-        open: candles[0].open,
-        high: candles[0].high,
-        low: candles[0].low,
-        close: candles[0].close,
-        volume: candles[0].volume,
+        close_time: time::bucket::end(start, interval_seconds),
+        ..candles[0].clone()
     };
     for candle in &candles[1..] {
-        folded.high = folded.high.max(candle.high);
-        folded.low = folded.low.min(candle.low);
-        folded.close = candle.close;
-        folded.volume += candle.volume;
+        folded.absorb(candle);
     }
     folded
 }
@@ -996,21 +1105,26 @@ mod tests {
     }
 
     #[test]
-    fn bucket_start_and_end_fold_sub_day() {
-        // 1h buckets at a 1h boundary.
-        assert_eq!(bucket_start(7_300_000, 3600.0), 7_200_000);
-        assert_eq!(bucket_end(3_600_000, 3600.0), 7_200_000);
-        // 4h buckets floor to the 4h grid.
-        assert_eq!(bucket_start(7_200_000, 14_400.0), 0);
-    }
-
-    #[test]
     fn fold_one_takes_open_high_low_close_and_sums_volume() {
         let folded = fold_one(&[bar(3_600_000, 10.0), bar(7_200_000, 12.0)], 14_400.0);
         assert_eq!(folded.open, 10.0);
         assert_eq!(folded.close, 12.0);
         assert_eq!(folded.volume, 2.0);
         assert_eq!(folded.open_time, 0);
+    }
+
+    #[test]
+    fn fold_one_of_a_quarter_spans_the_calendar_quarter() {
+        let february = time::calendar::make(2024, 2, 10, 0, 0, 0, 0).unwrap();
+        let folded = fold_one(&[bar(february, 10.0)], 7_776_000.0);
+        assert_eq!(
+            folded.open_time,
+            time::calendar::make(2024, 1, 1, 0, 0, 0, 0).unwrap()
+        );
+        assert_eq!(
+            folded.close_time,
+            time::calendar::make(2024, 4, 1, 0, 0, 0, 0).unwrap()
+        );
     }
 
     #[test]
@@ -1096,21 +1210,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn week_and_month_buckets_use_the_calendar() {
-        // A Thursday: 2024-01-11 12:00:00 UTC.
-        let thursday = calendar::make(2024, 1, 11, 12, 0, 0, 0).unwrap();
-        // The week (Mon) containing it starts Monday 2024-01-08.
-        let monday = calendar::make(2024, 1, 8, 0, 0, 0, 0).unwrap();
-        assert_eq!(bucket_start(thursday, 604_800.0), monday);
-        // A month bucket is the first of the month.
-        let first = calendar::make(2024, 1, 1, 0, 0, 0, 0).unwrap();
-        assert_eq!(bucket_start(thursday, 2_592_000.0), first);
-        // bucket_end for a month is the next month's start.
-        let february = calendar::make(2024, 2, 1, 0, 0, 0, 0).unwrap();
-        assert_eq!(bucket_end(first, 2_592_000.0), february);
-    }
-
     use crate::pine::compiler::program::{BarEvent, BarPhase, SymbolInfo};
     use crate::pine::compiler::{self, NoLibraries};
     use crate::pine::syntax::token::Limits;
@@ -1174,6 +1273,342 @@ mod tests {
         );
         assert_eq!(output.plots.len(), 1);
         assert_eq!(output.plots[0].values.last(), Some(&Some(120.0)));
+    }
+
+    /// ETHUSDT closes 100, 110, 120 on the same bars as a chart that closes 1, 2, 3.
+    fn eth_provider() -> TestProvider {
+        let mut provider = TestProvider::default();
+        provider.candles.insert(
+            SecurityKey {
+                symbol: "ETHUSDT".to_owned(),
+                interval: 60.0,
+                recent_bars: 0,
+            },
+            vec![bar(0, 100.0), bar(60_000, 110.0), bar(120_000, 120.0)],
+        );
+        provider
+    }
+
+    fn last_plotted(source: &str) -> Option<f64> {
+        let chart = [bar(0, 1.0), bar(60_000, 2.0), bar(120_000, 3.0)];
+        let body = format!("//@version=6\nindicator(\"T\")\n{source}\nplot(x)");
+        run(&body, eth_provider(), &chart).plots[0]
+            .values
+            .last()
+            .copied()
+            .flatten()
+    }
+
+    #[test]
+    fn a_script_variable_is_computed_on_the_requested_series() {
+        // The chart's `doubled` is 6; ETHUSDT's is 240.
+        assert_eq!(
+            last_plotted("doubled = close * 2\nx = request.security(\"ETHUSDT\", \"1\", doubled)"),
+            Some(240.0)
+        );
+    }
+
+    #[test]
+    fn a_chain_of_variables_keeps_its_indicator_state_and_history() {
+        // `ta.sma` runs over ETHUSDT's closes (110, 120), and `[1]` reads that series' previous bar.
+        assert_eq!(
+            last_plotted("mean = ta.sma(close, 2)\nx = request.security(\"ETHUSDT\", \"1\", mean)"),
+            Some(115.0)
+        );
+        assert_eq!(
+            last_plotted(
+                "doubled = close * 2\nx = request.security(\"ETHUSDT\", \"1\", doubled[1])"
+            ),
+            Some(220.0)
+        );
+    }
+
+    #[test]
+    fn a_reassigned_variable_and_a_function_that_reads_one_follow_the_series() {
+        assert_eq!(
+            last_plotted(
+                "level = 0.0\nif close > 105\n    level := close\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(120.0)
+        );
+        assert_eq!(
+            last_plotted(
+                "factor = 2\nscaled() =>\n    close * factor\nx = request.security(\"ETHUSDT\", \"1\", scaled())"
+            ),
+            Some(240.0)
+        );
+    }
+
+    #[test]
+    fn code_after_the_request_is_not_part_of_what_it_computes() {
+        // TradingView computes the variable as it stands where the request is written.
+        assert_eq!(
+            last_plotted(
+                "value = close\nx = request.security(\"ETHUSDT\", \"1\", value)\nvalue := value * 2"
+            ),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn a_collection_a_call_fills_is_filled_in_the_request_too() {
+        let request = "x = request.security(\"ETHUSDT\", \"1\", ";
+        // The array lives in the request's own state and gets one value per requested bar.
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\narray.push(samples, close)\n{request}array.size(samples))"
+            )),
+            Some(3.0)
+        );
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\nsamples.push(close)\nn = samples.size()\n{request}n)"
+            )),
+            Some(3.0)
+        );
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\narray.push(samples, close)\nfirst = array.get(samples, 0)\n{request}first)"
+            )),
+            Some(100.0),
+            "no out-of-bounds read of an array nothing filled"
+        );
+    }
+
+    #[test]
+    fn overloads_run_only_the_dependencies_of_the_one_called() {
+        // `bad` is only read by the string overload, and fails where the chart does not run it
+        // (ETHUSDT closes above 50, the chart below).
+        assert_eq!(
+            last_plotted(
+                "arr = array.new_float()\nbad = close > 50 ? array.get(arr, 5) : 0.0\nf(float v) =>\n    v * 2\nf(string s) =>\n    str.tostring(bad)\nx = request.security(\"ETHUSDT\", \"1\", f(close))"
+            ),
+            Some(240.0)
+        );
+    }
+
+    #[test]
+    fn a_function_that_only_reads_its_argument_is_not_replayed() {
+        // `checked` fails on the requested series (ETHUSDT closes above 50) but not on the chart's.
+        // It cannot change `level`, so the request has no business running it.
+        assert_eq!(
+            last_plotted(
+                "id(a) =>\n    a\nchecked(v) =>\n    if v > 50\n        runtime.error(\"boom\")\n    v\nlevel = id(close)\nunused = checked(level)\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn a_collection_a_function_returned_is_still_filled() {
+        assert_eq!(
+            last_plotted(
+                "makeArray() =>\n    array.new_float()\nvar samples = makeArray()\nsamples.push(close)\nn = samples.size()\nx = request.security(\"ETHUSDT\", \"1\", n)"
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            last_plotted(
+                "makeArray() =>\n    array.new_float()\nfill(a) =>\n    a.push(close)\nvar samples = makeArray()\nfill(samples)\nn = array.size(samples)\nx = request.security(\"ETHUSDT\", \"1\", n)"
+            ),
+            Some(3.0),
+            "a function that fills its parameter"
+        );
+    }
+
+    #[test]
+    fn a_local_in_a_block_is_not_resolved_to_the_global_with_its_name() {
+        // The request sees the `level` of the block it is written in.
+        assert_eq!(
+            last_plotted(
+                "level = 10.0\nvar float x = na\nif close > 0\n    level = 20.0\n    x := request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn a_read_only_overload_is_not_replayed_for_the_sake_of_a_mutating_one() {
+        // `checked(float)` fails on the requested series; only `checked(array<float>)` changes
+        // its parameter, and the call is the float one.
+        assert_eq!(
+            last_plotted(
+                "checked(float v) =>\n    if v > 50\n        runtime.error(\"boom\")\n    v\nchecked(array<float> a) =>\n    array.push(a, 1.0)\n    1.0\nlevel = close\nunused = checked(level)\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn a_block_local_assignment_is_not_a_write_of_the_global() {
+        // The block's own `level` is changed; the global is not, so the block stays out of the
+        // request (it would raise the error on the requested series).
+        assert_eq!(
+            last_plotted(
+                "level = close\nif close > 50\n    level = 5.0\n    level += 1\n    runtime.error(\"boom\")\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn a_collection_changed_through_an_alias_or_a_helper_is_filled() {
+        let request = "x = request.security(\"ETHUSDT\", \"1\", array.size(samples))";
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\nalias = samples\nalias.push(close)\n{request}"
+            )),
+            Some(3.0),
+            "through an alias"
+        );
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\naddSample() =>\n    array.push(samples, close)\naddSample()\n{request}"
+            )),
+            Some(3.0),
+            "a helper without arguments"
+        );
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\naddSample() =>\n    array.push(samples, close)\nrecord() =>\n    addSample()\nrecord()\n{request}"
+            )),
+            Some(3.0),
+            "a helper of a helper"
+        );
+    }
+
+    #[test]
+    fn a_block_reading_its_own_variable_does_not_pull_in_the_global() {
+        // The global `bad` fails on the requested series (ETHUSDT closes above 50); the block reads
+        // its own `bad`, so the request has no business running the global one.
+        assert_eq!(
+            last_plotted(
+                "arr = array.new_float()\nbad = close > 50 ? array.get(arr, 5) : 0.0\nlevel = close\nif close > 0\n    bad = close\n    level := bad\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            ),
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn a_collection_changed_through_a_local_alias_is_filled() {
+        let request = "x = request.security(\"ETHUSDT\", \"1\", array.size(samples))";
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\nif close > 0\n    alias = samples\n    alias.push(close)\n{request}"
+            )),
+            Some(3.0),
+            "an alias a block makes"
+        );
+        assert_eq!(
+            last_plotted(&format!(
+                "var samples = array.new_float()\nfill(a) =>\n    alias = a\n    alias.push(close)\nfill(samples)\n{request}"
+            )),
+            Some(3.0),
+            "an alias a helper makes of its parameter"
+        );
+    }
+
+    #[test]
+    fn the_collection_of_a_builtin_is_found_by_label_or_position() {
+        let request = "x = request.security(\"ETHUSDT\", \"1\", array.size(samples))";
+        for call in [
+            "array.push(value = close, id = samples)",
+            "array.push(samples, value = close)",
+            "array.push(samples, close)",
+        ] {
+            assert_eq!(
+                last_plotted(&format!(
+                    "var samples = array.new_float()\n{call}\n{request}"
+                )),
+                Some(3.0),
+                "{call}"
+            );
+        }
+    }
+
+    /// A line that only runs, and fails, on the ETHUSDT series (its closes are above 50).
+    const FAILS_ON_ETH: &str = "bad = close > 50 ? array.get(array.new_float(), 5) : 0.0\n";
+
+    #[test]
+    fn blocks_alias_names_do_not_merge_in_the_request() {
+        assert_eq!(
+            last_plotted(
+                "var samples = array.new_float()\nvar other = array.new_float()\nif close > 0\n    alias = samples\n    alias.push(close)\nif close > 50\n    alias = other\n    alias.push(array.get(other, 5))\nx = request.security(\"ETHUSDT\", \"1\", array.size(samples))"
+            ),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn a_builtin_does_not_replay_the_script_function_of_its_name() {
+        assert_eq!(
+            last_plotted(&format!(
+                "{FAILS_ON_ETH}sma(float src, int len) =>\n    src + bad\nx = request.security(\"ETHUSDT\", \"1\", ta.sma(close, 2))"
+            )),
+            Some(115.0)
+        );
+    }
+
+    #[test]
+    fn a_read_only_query_is_not_replayed_in_the_request() {
+        assert_eq!(
+            last_plotted(
+                "var samples = array.new_float()\narray.push(samples, close)\nunused = close > 50 ? array.get(array.new_float(), 1) + array.percentrank(samples, 0) : 0.0\nx = request.security(\"ETHUSDT\", \"1\", array.size(samples))"
+            ),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn a_read_only_user_method_is_not_replayed_in_the_request() {
+        assert_eq!(
+            last_plotted(&format!(
+                "{FAILS_ON_ETH}level = close\nmethod push(float this, float v) =>\n    v + bad\nr = level.push(1.0)\nx = request.security(\"ETHUSDT\", \"1\", level)"
+            )),
+            Some(120.0)
+        );
+    }
+
+    /// Runs `source` on one chart bar that gets two live ticks, as the session does for a bar that
+    /// has not closed, and returns the last value of the first plot after each tick.
+    fn plotted_after_each_tick(source: &str) -> Vec<Option<f64>> {
+        let body = format!("//@version=6\nindicator(\"T\")\n{source}");
+        let program = compiler::compile(&body, Limits::default(), &NoLibraries);
+        let mut session = Session::new(
+            program,
+            HashMap::new(),
+            Limits::default(),
+            None,
+            SymbolInfo::default(),
+            Some(Box::new(eth_provider())),
+            None,
+        );
+        [true, false]
+            .into_iter()
+            .map(|is_new| {
+                let _ = session.execute(
+                    BarEvent {
+                        candle: bar(0, 1.0),
+                        phase: BarPhase::RealtimeTick { is_new },
+                    },
+                    true,
+                    None,
+                );
+                session.output().plots[0].values.last().copied().flatten()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_request_does_not_touch_the_charts_varip_state() {
+        let counter = "varip n = 0\nn += 1\nplot(n)\n";
+        let alone = plotted_after_each_tick(counter);
+        assert_eq!(alone, [Some(1.0), Some(2.0)]);
+        // The same counter, read by a request whose result nothing uses.
+        let requested = plotted_after_each_tick(&format!(
+            "{counter}ignored = request.security(\"ETHUSDT\", \"1\", n)"
+        ));
+        assert_eq!(requested, alone);
     }
 
     #[test]

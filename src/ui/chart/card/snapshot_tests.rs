@@ -8,7 +8,7 @@ use crate::model::{ChartCanvas, Drawing, Tool};
 use eframe::egui::ColorImage;
 use eframe::egui::epaint::ClippedShape;
 
-fn input(harness: &Harness, include_trading: bool) -> SnapshotInput<'_> {
+pub(super) fn input(harness: &Harness, include_trading: bool) -> SnapshotInput<'_> {
     SnapshotInput {
         symbol: "BTCUSDT",
         source: DataSource::Binance,
@@ -21,6 +21,7 @@ fn input(harness: &Harness, include_trading: bool) -> SnapshotInput<'_> {
         hide_all_drawings: false,
         replay_active: harness.replay_active,
         include_trading,
+        frame: SnapshotFrame::default(),
     }
 }
 
@@ -61,7 +62,7 @@ fn describe(shape: &Shape) -> String {
     }
 }
 
-fn dumped(shapes: &[ClippedShape]) -> Vec<String> {
+pub(super) fn dumped(shapes: &[ClippedShape]) -> Vec<String> {
     shapes
         .iter()
         .map(|clipped| format!("{:?} {}", clipped.clip_rect, describe(&clipped.shape)))
@@ -76,7 +77,7 @@ fn gist(dump: &str) -> String {
 /// The live chart's last frame with nothing pointing at it, and its plot's rectangle. The
 /// scale button of the corner is the live chart's alone and has a test of its own below, so the
 /// comparisons of everything else leave it out.
-fn settled(harness: &mut Harness) -> (Vec<ClippedShape>, Rect) {
+pub(super) fn settled(harness: &mut Harness) -> (Vec<ClippedShape>, Rect) {
     harness.card.set_scale_menu(false);
     let mut last = harness.frame();
     for _ in 0..4 {
@@ -172,7 +173,7 @@ fn comparison_overlays_snapshot_as_they_draw() {
     same_as_live(&mut harness, false);
 }
 
-fn everything_on() -> IndicatorConfig {
+pub(super) fn everything_on() -> IndicatorConfig {
     IndicatorConfig {
         show_volume: true,
         show_rsi: true,
@@ -183,7 +184,7 @@ fn everything_on() -> IndicatorConfig {
     }
 }
 
-fn trend_line() -> Drawing {
+pub(super) fn trend_line() -> Drawing {
     Drawing::build(
         Tool::TrendLine,
         1,
@@ -485,6 +486,7 @@ fn the_crosshair_a_hover_and_the_replay_badge_never_reach_a_snapshot() {
         frozen: false,
         owner_id: 1,
         x_fraction: 0.4,
+        time: None,
         price: 240.0,
     });
     pointed.pointer = Some(Pos2::new(300.0, 200.0));
@@ -1801,4 +1803,44 @@ fn gallery_of_the_cards() {
         std::fs::write(dir.join(format!("cards-1{suffix}.png")), png).expect("written");
     }
     theme::apply(&egui::Context::default(), AppTheme::Dark);
+}
+
+#[test]
+fn a_snapshot_never_holds_what_the_demonstration_cursor_marked() {
+    use crate::model::CursorMode;
+    use crate::model::cursor::demo::MarkShape;
+    let mut harness = Harness::new(ChartCanvas::default());
+    let rect = Rect::from_min_size(Pos2::ZERO, SIZE);
+    let words = |harness: &Harness| {
+        snapshot_shapes(harness, rect, false)
+            .iter()
+            .map(|clipped| describe(&clipped.shape))
+            .collect::<Vec<_>>()
+    };
+    let before = words(&harness);
+    harness.card.set_cursor_mode(CursorMode::Demonstration);
+    let at = crate::model::Anchor {
+        time_ms: harness.candles[150].open_time,
+        price: 120.0,
+    };
+    harness.card.demo.begin(at, 0.0);
+    harness
+        .card
+        .demo
+        .extend(crate::model::Anchor { price: 130.0, ..at });
+    harness.card.demo.dot(at, 0.0);
+    assert!(
+        harness
+            .card
+            .demo
+            .marks()
+            .iter()
+            .any(|mark| matches!(mark.shape, MarkShape::Stroke(_))),
+        "the marks are there"
+    );
+    assert_eq!(
+        words(&harness),
+        before,
+        "and the snapshot does not know them"
+    );
 }

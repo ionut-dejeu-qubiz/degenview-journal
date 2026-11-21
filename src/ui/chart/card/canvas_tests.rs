@@ -90,13 +90,21 @@ pub(super) struct Harness {
     pub(super) error: Option<ProviderError>,
     pub(super) scale_mode: PriceScaleMode,
     pub(super) source: DataSource,
+    /// The time of the next frame in seconds, for what waits on it (a tooltip's delay).
+    pub(super) clock: f64,
+    /// The pointer as last told to egui: a still pointer sends no event, as in a real window.
+    sent: Option<Pos2>,
+    /// A press or a release of the primary button to send with the next frame.
+    pub(super) button: Option<bool>,
+    /// The window's size; `SIZE` unless a test wants a narrower chart.
+    pub(super) size: Vec2,
 }
 
 impl Harness {
     pub(super) fn new(canvas: ChartCanvas) -> Self {
         let mut card = ChartCard::default();
         card.appearance_mut().canvas = canvas;
-        card.set_timeframe(Timeframe::Hour);
+        card.set_timeframe(Timeframe::HOUR_1);
         Self {
             ctx: egui::Context::default(),
             card,
@@ -109,19 +117,34 @@ impl Harness {
             error: None,
             scale_mode: PriceScaleMode::Regular,
             source: DataSource::Binance,
+            clock: 0.0,
+            sent: None,
+            button: None,
+            size: SIZE,
         }
     }
 
     pub(super) fn frame(&mut self) -> (Vec<ClippedShape>, ChartPointer) {
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+            time: Some(self.clock),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
             events: self
                 .pointer
+                .filter(|at| self.sent != Some(*at))
                 .map(egui::Event::PointerMoved)
                 .into_iter()
+                .chain(self.button.take().zip(self.pointer).map(|(pressed, pos)| {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }
+                }))
                 .collect(),
             ..Default::default()
         };
+        self.sent = self.pointer;
         let mut pointer = ChartPointer::default();
         let source = self.source;
         let (card, candles, replay_active, crosshair, error, scale_mode) = (
@@ -135,7 +158,7 @@ impl Harness {
         let (indicators, drawings) = (&self.indicators, &self.drawings);
         let mut output = self.ctx.run_ui(input, |ui| {
             let mut drawing = DrawingFrame::new(drawings, crate::model::Tool::Cursor, None, 1)
-                .with_view(Timeframe::Hour, false);
+                .with_view(Timeframe::HOUR_1, false);
             let mut replay = ReplayChartFrame {
                 selecting: false,
                 active: replay_active,
@@ -573,6 +596,7 @@ fn plot_of(card: &ChartCard, candles: &[Kline]) -> (Rect, View) {
     let plot = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0));
     let view = card
         .view(
+            card.framing(),
             candles,
             (plot, 0.0),
             PriceScaleMode::Regular,
@@ -618,6 +642,7 @@ fn the_margins_follow_the_chart_whatever_its_type_or_scale() {
             let plot = Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0));
             let view = card
                 .view(
+                    card.framing(),
                     &candles,
                     (plot, 0.0),
                     PriceScaleMode::from_log_flag(log),
@@ -631,6 +656,54 @@ fn the_margins_follow_the_chart_whatever_its_type_or_scale() {
                 "{chart_type:?} log {log}: {top} {bottom}"
             );
         }
+    }
+}
+
+#[test]
+fn the_scale_reaches_the_wicks_that_are_drawn_when_a_bar_stops_short_of_its_open() {
+    let card = ChartCard::default();
+    let bar = |open, high, low, close| Kline {
+        open,
+        high,
+        low,
+        close,
+        ..series(1)[0]
+    };
+    // Open above the high, close below the low: the wick is drawn out to both.
+    let shown = [
+        bar(110.0, 105.0, 95.0, 90.0),
+        bar(100.0, 101.0, 99.0, 100.0),
+    ];
+    assert_eq!(card.value_range(&shown, ChartType::Candles), (90.0, 110.0));
+    assert_eq!(card.value_range(&shown, ChartType::Bars), (90.0, 110.0));
+}
+
+#[test]
+fn the_last_price_follows_the_charts_reference_for_up_and_down() {
+    // The last bar closes above its open but below the bar before it.
+    let mut candles = series(40);
+    let before = candles[38].close;
+    let last = candles.last_mut().expect("a bar");
+    last.close = before - 1.0;
+    last.open = before - 3.0;
+    for (by_previous_close, rising) in [(true, false), (false, true)] {
+        let mut harness = Harness::new(ChartCanvas::default());
+        harness.candles = candles.clone();
+        harness
+            .card
+            .chart_style_mut()
+            .candles
+            .color_by_previous_close = by_previous_close;
+        let (up, down) = (harness.card.bullish_color(), harness.card.bearish_color());
+        let (drawn, _) = harness.draw();
+        let tag = |color| {
+            drawn
+                .rects
+                .iter()
+                .any(|(rect, fill)| rect.min.x > SIZE.x - 90.0 && *fill == color)
+        };
+        assert_eq!(tag(up), rising, "by previous close: {by_previous_close}");
+        assert_eq!(tag(down), !rising, "by previous close: {by_previous_close}");
     }
 }
 
@@ -803,7 +876,7 @@ fn the_watermark_names_the_market_timeframe_and_source_and_sits_behind_the_candl
         drawn
             .texts
             .iter()
-            .any(|(_, text, _)| text.contains("1H") && text.contains("Binance")),
+            .any(|(_, text, _)| text.contains("1h") && text.contains("Binance")),
         "{:?}",
         drawn
             .texts
@@ -843,6 +916,7 @@ fn the_crosshair_takes_its_style_and_stays_above_the_series() {
         frozen: false,
         owner_id: 1,
         x_fraction: 0.5,
+        time: None,
         price: 230.0,
     });
     let (drawn, _) = harness.draw();
@@ -859,6 +933,7 @@ fn the_crosshair_takes_its_style_and_stays_above_the_series() {
         frozen: false,
         owner_id: 99,
         x_fraction: 0.5,
+        time: Some(harness.candles[250].open_time as f64),
         price: 230.0,
     });
     let (other, _) = harness.draw();
@@ -872,6 +947,117 @@ fn the_crosshair_takes_its_style_and_stays_above_the_series() {
     );
 }
 
+/// A chart drawn with another chart's crosshair at `time`: the time its vertical line lies at,
+/// `None` when it draws none.
+fn crosshair_time_on(mut harness: Harness, time: Option<f64>) -> Option<f64> {
+    let colour = Color32::from_rgba_unmultiplied(255, 128, 0, 200);
+    let canvas = &mut harness.card.appearance_mut().canvas;
+    canvas.crosshair.color = Some([255, 128, 0, 200]);
+    canvas.crosshair.dash = LineDash::Solid;
+    harness.crosshair = Some(CrosshairInfo {
+        frozen: false,
+        owner_id: 99,
+        x_fraction: 0.5,
+        time,
+        price: 230.0,
+    });
+    let (drawn, _) = harness.draw();
+    let probe = harness.card.probe.expect("a frame was drawn");
+    let columns: Vec<f32> = drawn
+        .segments
+        .iter()
+        .filter(|(points, stroke)| stroke.color == colour && points[0].x == points[1].x)
+        .map(|(points, _)| points[0].x)
+        .collect();
+    assert!(columns.len() <= 1, "one column at most: {columns:?}");
+    let x = *columns.first()?;
+    let slot = probe.start as f64 - f64::from(probe.lead)
+        + f64::from(x - probe.plot.left()) / f64::from(probe.slot_width);
+    crate::model::chart::sync::TimeAxis::new(&harness.candles).time_at(slot)
+}
+
+fn zoomed(visible: usize, right_offset: f64) -> Harness {
+    let mut harness = Harness::new(ChartCanvas::default());
+    harness.card.viewport.horizontal = crate::model::chart::viewport::HorizontalViewport {
+        visible,
+        right_offset,
+    };
+    harness
+}
+
+#[test]
+fn charts_of_any_zoom_draw_the_shared_crosshair_at_the_same_time() {
+    let wanted = 260.0 * HOUR as f64 + HOUR as f64 / 4.0;
+    for harness in [zoomed(60, 0.0), zoomed(200, 30.0), zoomed(120, 45.5)] {
+        let drawn = crosshair_time_on(harness, Some(wanted)).expect("a column");
+        // The line is snapped to a pixel, up to a fifth of a bar at the widest zoom.
+        assert!(
+            (drawn - wanted).abs() < HOUR as f64 / 5.0,
+            "{drawn} is not {wanted}"
+        );
+    }
+}
+
+#[test]
+fn a_crosshair_time_off_the_screen_or_unknown_draws_no_column() {
+    assert_eq!(
+        crosshair_time_on(zoomed(60, 0.0), Some(100.0 * HOUR as f64)),
+        None
+    );
+    assert_eq!(crosshair_time_on(zoomed(60, 0.0), None), None);
+}
+
+#[test]
+fn a_price_based_chart_draws_no_shared_column() {
+    let mut renko = zoomed(120, 0.0);
+    renko.card.appearance_mut().style.chart_type = ChartType::Renko;
+    assert_eq!(crosshair_time_on(renko, Some(290.0 * HOUR as f64)), None);
+}
+
+#[test]
+fn a_price_based_chart_still_draws_its_own_column_under_the_pointer() {
+    let mut renko = Harness::new(ChartCanvas::default());
+    renko.card.appearance_mut().style.chart_type = ChartType::Renko;
+    renko.crosshair = Some(CrosshairInfo {
+        frozen: false,
+        owner_id: 1,
+        x_fraction: 0.5,
+        time: None,
+        price: 230.0,
+    });
+    let (drawn, _) = renko.draw();
+    let own = Color32::from_gray(135).gamma_multiply(0.6);
+    assert!(
+        drawn
+            .segments
+            .iter()
+            .any(|(points, stroke)| stroke.color == own && points[0].y == points[1].y),
+        "the price line of the pointer's own chart"
+    );
+}
+
+#[test]
+fn a_chart_reports_the_time_under_its_pointer_only_when_its_slots_are_time() {
+    let mut harness = zoomed(100, 20.0);
+    harness.draw();
+    let probe = harness.card.probe.expect("a frame was drawn");
+    let at = Pos2::new(
+        probe.plot.left() + probe.plot.width() * 0.5,
+        probe.plot.top() + 200.0,
+    );
+    harness.pointer = Some(at);
+    let (_, pointer) = harness.draw();
+    let slot = probe.start as f64 - f64::from(probe.lead)
+        + f64::from(at.x - probe.plot.left()) / f64::from(probe.slot_width);
+    let time = pointer.hover_time.expect("a time");
+    assert!((time - slot * HOUR as f64).abs() < HOUR as f64 / 100.0);
+
+    harness.card.appearance_mut().style.chart_type = ChartType::Kagi;
+    let (_, pointer) = harness.draw();
+    assert!(pointer.hover_x_fraction.is_some());
+    assert_eq!(pointer.hover_time, None);
+}
+
 #[test]
 fn a_dashed_crosshair_is_the_default_and_a_style_change_keeps_the_position() {
     let mut harness = Harness::new(ChartCanvas::default());
@@ -879,6 +1065,7 @@ fn a_dashed_crosshair_is_the_default_and_a_style_change_keeps_the_position() {
         frozen: false,
         owner_id: 1,
         x_fraction: 0.25,
+        time: None,
         price: 230.0,
     });
     let (dashed, _) = harness.draw();
@@ -912,6 +1099,7 @@ fn the_ohlc_readout_hides_without_touching_the_crosshair() {
         frozen: false,
         owner_id: 1,
         x_fraction: 0.5,
+        time: None,
         price: 230.0,
     });
     let crosshair_lines = |drawn: &Drawn| {
@@ -947,6 +1135,102 @@ fn the_ohlc_readout_hides_without_touching_the_crosshair() {
     assert!(
         hidden.texts.iter().any(|(_, text, _)| !text.is_empty()),
         "the axis tags still draw"
+    );
+}
+
+#[test]
+fn each_cursor_keeps_only_its_own_parts_of_the_crosshair() {
+    use crate::model::CursorMode;
+    let line = Color32::from_gray(135).gamma_multiply(0.6);
+    let tag = Color32::from_gray(79);
+    let readout = |drawn: &Drawn| {
+        ["O ", "H ", "L ", "C "].into_iter().all(|label| {
+            drawn
+                .texts
+                .iter()
+                .any(|(_, text, _)| text.starts_with(label))
+        })
+    };
+    for (mode, lines, tags) in [
+        (CursorMode::Cross, true, true),
+        (CursorMode::Dot, false, true),
+        (CursorMode::Arrow, false, false),
+    ] {
+        let mut harness = Harness::new(ChartCanvas::default());
+        harness.card.set_cursor_mode(mode);
+        harness.crosshair = Some(CrosshairInfo {
+            frozen: false,
+            owner_id: 1,
+            x_fraction: 0.5,
+            time: None,
+            price: 230.0,
+        });
+        let (drawn, _) = harness.draw();
+        let drawn_lines = drawn
+            .segments
+            .iter()
+            .filter(|(_, stroke)| stroke.color == line)
+            .count();
+        let drawn_tags = drawn.rects.iter().filter(|(_, fill)| *fill == tag).count();
+        assert_eq!(drawn_lines > 0, lines, "{mode:?} lines: {drawn_lines}");
+        assert_eq!(drawn_tags, if tags { 2 } else { 0 }, "{mode:?} tags");
+        assert!(readout(&drawn), "{mode:?} still names the bar");
+    }
+}
+
+#[test]
+fn the_demonstration_marks_are_painted_over_the_chart_and_its_background() {
+    use crate::model::CursorMode;
+    // Every shape of the frame, in painting order.
+    fn flat(shape: &Shape, out: &mut Vec<Shape>) {
+        match shape {
+            Shape::Vec(shapes) => shapes.iter().for_each(|shape| flat(shape, out)),
+            other => out.push(other.clone()),
+        }
+    }
+    let marked = |harness: &mut Harness| -> Vec<Shape> {
+        let mut all = Vec::new();
+        for clipped in harness.frame().0 {
+            flat(&clipped.shape, &mut all);
+        }
+        all
+    };
+    let mut harness = Harness::new(ChartCanvas::default());
+    let id = harness.card.add_pine_instance(
+        None,
+        "Ground",
+        "//@version=6\nindicator(\"Ground\", overlay = true)\nbgcolor(color.new(color.red, 0))\n",
+    );
+    wait_for_run(&mut harness, id);
+    harness.card.set_cursor_mode(CursorMode::Demonstration);
+    harness.draw();
+    let at = crate::model::Anchor {
+        time_ms: harness.candles[250].open_time,
+        price: harness.candles[250].close,
+    };
+    harness.card.demo.dot(at, 0.0);
+    let shapes = marked(&mut harness);
+    let mark = shapes
+        .iter()
+        .position(
+            |shape| matches!(shape, Shape::Circle(circle) if circle.fill == crate::ui::kit::ORANGE),
+        )
+        .expect("the dot is painted");
+    let candle = shapes
+        .iter()
+        .rposition(|shape| {
+            matches!(shape, Shape::Rect(rect) if rect.fill == Color32::from_rgb(48, 209, 88)
+                || rect.fill == Color32::from_rgb(255, 69, 58))
+        })
+        .expect("candles are painted");
+    assert!(
+        mark > candle,
+        "the mark ({mark}) is under a candle ({candle})"
+    );
+    assert_eq!(
+        mark,
+        shapes.len() - 1,
+        "nothing of the chart is painted over the mark"
     );
 }
 

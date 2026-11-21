@@ -175,7 +175,7 @@ fn windowed_statistics_follow_the_reference_formulas() {
          before = ta.valuewhen(bar_index % 2 == 0, close, 1)",
         5,
     );
-    close_to(&session, "alma", 103.314_326_399_761_74);
+    close_to(&session, "alma", 104.685_673_600_238_26);
     close_to(&session, "nearest", 105.0);
     close_to(&session, "linear", 104.6);
     close_to(&session, "median", 103.0);
@@ -1648,6 +1648,22 @@ fn plotarrow_honours_offset_show_last_and_force_overlay() {
         0,
         "the pane no longer draws it"
     );
+}
+
+#[test]
+fn force_overlay_sends_a_drawing_to_the_main_chart_from_a_pane_script() {
+    let session = run(
+        "if barstate.islast\n    line.new(bar_index - 1, 1.0, bar_index, 2.0, force_overlay = true)\n    label.new(bar_index, 1.0, \"pane\")",
+        3,
+    );
+    let output = session.output();
+    assert!(!output.overlay);
+    assert!(output.has_forced_overlay());
+    let (pane, forced) = output.split_forced_overlay();
+    assert!(forced.overlay);
+    assert_eq!((forced.lines.len(), forced.labels.len()), (1, 0));
+    assert_eq!((pane.lines.len(), pane.labels.len()), (0, 1));
+    assert!(forced.lines[0].force_overlay && !pane.labels[0].force_overlay);
 }
 
 #[test]

@@ -400,12 +400,14 @@ fn a_portable_setting_travels_and_local_ones_do_not() {
 }
 
 /// Keys this version keeps on the Mac, from security and consent state to a key it has never heard of.
-const LOCAL_ONLY_KEYS: [&str; 6] = [
+const LOCAL_ONLY_KEYS: [&str; 8] = [
     "mcp.settings",
     "mcp.permissions",
     "ai.prefs",
+    "net.proxy",
     "update.channel",
     "content.prefs",
+    "drawing.favoritesBar",
     "from.a.newer.version",
 ];
 
@@ -998,6 +1000,43 @@ fn a_layout_and_its_drawings_arrive_as_separate_records() {
     let on_b = rows(&b, "saved_view");
     assert_eq!(on_b.len(), 1);
     assert_eq!(drawings_of(&on_b[0], 1), [(1, 1.0), (2, 2.0)]);
+    assert_eq!(outbox_len(&a) + outbox_len(&b), 0);
+}
+
+#[test]
+fn drawings_of_two_markets_travel_as_one_record_each_and_arrive_filed_by_market() {
+    let (cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let mut row = layout(10, "Main", &[(1, "BTC", &[(1, 1.0), (2, 2.0)])]);
+    for (drawing, market) in row.0["charts"][0]["drawings"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(["BINANCE:BTCUSDT", "BINANCE:ETHUSDT"])
+    {
+        let body = drawing
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        body["market"] = json!(market);
+        body["since"] = json!(crate::model::drawings::DRAWING_FORMAT);
+    }
+    put_layouts(&a, &[row]);
+    settle(&mut a, &mut b);
+    assert_eq!(
+        cloud.names(),
+        ["layout.10", "layoutdrawing.10.1.1", "layoutdrawing.10.1.2"],
+        "the market is in the drawing: no other record, no other key"
+    );
+    let on_b: crate::model::SavedView =
+        serde_json::from_value(rows(&b, "saved_view")[0].clone()).unwrap();
+    let drawings = &on_b.charts[0].drawings;
+    assert_eq!(drawings.get("BINANCE:BTCUSDT").len(), 1);
+    assert_eq!(drawings.get("BINANCE:ETHUSDT").len(), 1);
+    assert_eq!(drawings.highest_id(), Some(2));
     assert_eq!(outbox_len(&a) + outbox_len(&b), 0);
 }
 
@@ -1903,6 +1942,34 @@ fn deleting_a_line_tool_drawing_propagates_and_an_unrelated_one_stays() {
         16
     );
     // The drawings agree; the rows differ only in what stays per Mac (autosave, last opened).
+    assert_eq!(
+        rows(&a, "saved_view")[0]["charts"][0]["drawings"],
+        on_b[0]["charts"][0]["drawings"]
+    );
+}
+
+#[test]
+fn an_eraser_sweep_that_removes_several_drawings_arrives_whole_and_the_rest_stay() {
+    let (_cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let drawings = every_line_tool();
+    put_layouts(&a, &[layout_of(10, "Lines", &drawings)]);
+    settle(&mut a, &mut b);
+    // One sweep took the first, a middle and the last drawing in one save.
+    let kept: Vec<_> = drawings
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| ![0, 7, drawings.len() - 1].contains(index))
+        .map(|(_, drawing)| drawing.clone())
+        .collect();
+    put_layouts(&a, &[layout_of(10, "Lines", &kept)]);
+    settle(&mut a, &mut b);
+    let on_b = rows(&b, "saved_view");
+    assert_eq!(
+        on_b[0]["charts"][0]["drawings"].as_array().unwrap().len(),
+        drawings.len() - 3
+    );
     assert_eq!(
         rows(&a, "saved_view")[0]["charts"][0]["drawings"],
         on_b[0]["charts"][0]["drawings"]
@@ -3196,4 +3263,76 @@ fn a_mac_that_never_set_a_provider_up_does_not_erase_this_macs_settings_for_it()
         "while what this Mac has for the other one stays"
     );
     assert_eq!(prefs["consented"], json!(["mine.example"]));
+}
+
+#[test]
+fn the_studios_look_follows_the_later_edit_and_an_older_mac_does_not_erase_it() {
+    let (cloud, mut a, mut b) = pair();
+    a.core.start();
+    b.core.start();
+    let look = json!({
+        "style": "styled", "size": "wide16x9", "background": "luminous",
+        "include": {"indicators": true, "drawings": true, "branding": false}
+    });
+    b.store
+        .lock()
+        .unwrap()
+        .set_setting(
+            "snapshot.prefs",
+            &json!({"provider": null, "providers": {}, "include_trading": false, "scale": "X1", "consented": ["trusted.example"]}),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    a.store
+        .lock()
+        .unwrap()
+        .set_setting(
+            "snapshot.prefs",
+            &json!({
+                "provider": null, "providers": {}, "include_trading": false, "scale": "X2",
+                "studio": look, "consented": ["evil.example"]
+            }),
+        )
+        .unwrap();
+    settle(&mut a, &mut b);
+    let stored = |mac: &Mac| {
+        mac.store
+            .lock()
+            .unwrap()
+            .raw_setting("snapshot.prefs")
+            .unwrap()
+            .unwrap()
+    };
+    let prefs = stored(&b);
+    assert_eq!(prefs["studio"], look, "the look arrives");
+    assert_eq!(prefs["consented"], json!(["trusted.example"]));
+    let read: crate::model::chart::snapshot::SnapshotPrefs = serde_json::from_value(prefs).unwrap();
+    assert_eq!(
+        read.studio.background,
+        crate::model::chart::snapshot::studio::Background::Luminous
+    );
+    assert_eq!(
+        outbox_len(&b),
+        0,
+        "a Mac that merely received the look does not send it back"
+    );
+
+    // A Mac from before the Studio changes the scale and sends no look: it is not erased.
+    cloud.put_from_elsewhere(
+        raw(
+            "setting.snapshot.prefs",
+            &json!({"provider": null, "providers": {}, "include_trading": true, "scale": "X1"}),
+            9,
+            4_000_000_000_000,
+            "Z",
+        ),
+        "Z",
+    );
+    settle(&mut a, &mut b);
+    for mac in [&a, &b] {
+        let prefs = stored(mac);
+        assert_eq!(prefs["scale"], "X1", "what the older Mac changed is taken");
+        assert_eq!(prefs["include_trading"], true);
+        assert_eq!(prefs["studio"], look, "and the look stays");
+    }
 }

@@ -1,10 +1,13 @@
+use super::candles::plan;
 use super::catalog::Catalog;
-use crate::model::Kline;
-use crate::service::{MarketSource, ProviderError, SearchResult, fold_calendar, rank_results};
+use crate::model::market::bucket;
+use crate::model::{DataSource, Kline, TimeUnit, Timeframe};
+use crate::service::{MarketSource, ProviderError, SearchResult, rank_results};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const BARS_URL: &str = "https://data.alpaca.markets/v2/stocks";
+const DAY_MS: i64 = 86_400_000;
 
 pub struct Alpaca;
 
@@ -33,106 +36,100 @@ pub fn test_connection(key_id: &str, secret_key: &str) -> Result<(), ProviderErr
     .map_err(ProviderError::Alpaca)
 }
 
-/// Quarterly and yearly bars don't exist on Alpaca; they fold monthly ones.
-fn monthly_fold(interval: &str) -> Option<i64> {
-    match interval {
-        "3M" => Some(7_776_000),
-        "1Y" => Some(31_536_000),
-        _ => None,
+/// The most bars one request returns.
+const MAX_BARS: usize = 10_000;
+
+/// The `timeframe` token Alpaca's API takes for a length it serves natively.
+fn token(timeframe: Timeframe) -> String {
+    let count = timeframe.count();
+    match timeframe.unit() {
+        TimeUnit::Minute => format!("{count}Min"),
+        TimeUnit::Hour => format!("{count}Hour"),
+        TimeUnit::Day => format!("{count}Day"),
+        TimeUnit::Week => format!("{count}Week"),
+        TimeUnit::Month => format!("{count}Month"),
     }
 }
 
-fn timeframe(interval: &str) -> &'static str {
-    match interval {
-        "1h" => "1Hour",
-        "1d" => "1Day",
-        "1w" => "1Week",
-        "1M" => "1Month",
-        _ => "1Day",
+/// How much wall-clock time a bar's worth of data spans on average. Markets are open about
+/// 6.5 of 24 hours and five days of seven, so intraday bars are far apart in time.
+fn gap_factor(timeframe: Timeframe) -> f64 {
+    match timeframe.unit() {
+        TimeUnit::Minute | TimeUnit::Hour => 6.0,
+        TimeUnit::Day => 2.0,
+        TimeUnit::Week => 1.6,
+        TimeUnit::Month => 1.5,
     }
 }
 
-fn seconds_per_candle(interval: &str) -> i64 {
-    match interval {
-        "1h" => 3_600,
-        "1d" => 86_400,
-        "1w" => 604_800,
-        "1M" => 2_592_000,
-        _ => 86_400,
+/// The shortest window worth asking for: a long weekend or a holiday holds no intraday bar,
+/// and a request for the newest few bars must still reach the last session.
+fn min_lookback_ms(timeframe: Timeframe) -> i64 {
+    if timeframe.is_intraday() {
+        7 * DAY_MS
+    } else {
+        0
     }
 }
 
-fn market_gap_factor(interval: &str) -> f64 {
-    match interval {
-        "1h" => 6.0,
-        "1d" => 2.0,
-        "1w" => 1.6,
-        "1M" => 1.5,
-        _ => 2.0,
-    }
+/// Where a bar of `timeframe` that opens at `open_ms` ends: a millisecond before the next opens.
+/// Alpaca stamps days, weeks and months at New York midnight, so the offset into the UTC day is
+/// kept; across a clock change it lands an hour off New York midnight.
+fn close_ms(timeframe: Timeframe, open_ms: i64) -> i64 {
+    let next = match timeframe.unit() {
+        TimeUnit::Month => {
+            let day_start = open_ms.div_euclid(DAY_MS) * DAY_MS;
+            bucket::next_bucket_start_ms(timeframe, day_start) + (open_ms - day_start)
+        }
+        _ => open_ms + timeframe.nominal_ms(),
+    };
+    next - 1
+}
+
+/// Where a request for the newest `requested` bars of `timeframe` starts looking: far enough
+/// back to hold them through the gaps between sessions, and never before Alpaca's data begins.
+fn lookback_start_ms(timeframe: Timeframe, requested: i64, now_ms: i64) -> i64 {
+    let span =
+        (timeframe.nominal_ms() as f64 * requested.max(1) as f64 * gap_factor(timeframe)) as i64;
+    (now_ms - span.max(min_lookback_ms(timeframe))).max(EARLIEST_MS)
 }
 
 impl MarketSource for Alpaca {
     fn fetch_klines(
         &self,
         symbol: &str,
-        interval: &str,
+        timeframe: Timeframe,
         limit: u32,
     ) -> Result<Vec<Kline>, ProviderError> {
-        let fold_seconds = monthly_fold(interval);
-        let source_interval = if fold_seconds.is_some() {
-            "1M"
-        } else {
-            interval
-        };
-        let requested = fold_seconds
-            .map(|_| (i64::from(limit) + 1) * 12)
-            .unwrap_or(i64::from(limit));
-        let lookback = seconds_per_candle(source_interval) as f64
-            * requested.max(1) as f64
-            * market_gap_factor(source_interval);
+        let plan = plan(DataSource::Alpaca, timeframe)?;
+        let requested = plan.base_count(limit as usize).min(MAX_BARS);
         let bars = fetch_bars(
             symbol,
-            source_interval,
-            crate::service::now_ms() - (lookback * 1_000.0) as i64,
+            plan.base(),
+            lookback_start_ms(plan.base(), requested as i64, crate::service::now_ms()),
             None,
-            requested as usize,
+            requested,
         )?;
-        let shown = match fold_seconds {
-            Some(seconds) => fold_calendar(&bars, seconds, bars.len() >= requested as usize),
-            None => bars,
-        };
-        let start = shown.len().saturating_sub(limit as usize);
-        Ok(shown[start..].to_vec())
+        Ok(plan.shape(bars, requested, limit as usize))
     }
 
     fn fetch_klines_range(
         &self,
         symbol: &str,
-        interval: &str,
+        timeframe: Timeframe,
         start_ms: i64,
         end_ms: i64,
         max: usize,
     ) -> Result<Vec<Kline>, ProviderError> {
-        let fold_seconds = monthly_fold(interval);
-        let source_interval = if fold_seconds.is_some() {
-            "1M"
-        } else {
-            interval
-        };
+        let plan = plan(DataSource::Alpaca, timeframe)?;
         // Alpaca's data starts in the 2010s; an earlier start only costs it a refusal.
         let start = start_ms.max(EARLIEST_MS);
-        let wanted = max * fold_seconds.map_or(1, |seconds| (seconds / 2_592_000) as usize + 1);
-        let bars: Vec<Kline> = fetch_bars(symbol, source_interval, start, Some(end_ms), wanted)?
+        let requested = plan.base_count(max).min(MAX_BARS);
+        let bars: Vec<Kline> = fetch_bars(symbol, plan.base(), start, Some(end_ms), requested)?
             .into_iter()
             .filter(|bar| bar.open_time < end_ms)
             .collect();
-        let shown = match fold_seconds {
-            Some(seconds) => fold_calendar(&bars, seconds, bars.len() >= wanted),
-            None => bars,
-        };
-        let skip = shown.len().saturating_sub(max);
-        Ok(shown[skip..].to_vec())
+        Ok(plan.shape(bars, requested, max))
     }
 
     fn search_tickers(&self, query: &str) -> Result<Vec<SearchResult>, ProviderError> {
@@ -211,11 +208,11 @@ fn parse_assets(body: &str) -> Result<Vec<Asset>, ProviderError> {
 /// 2000-01-01.
 const EARLIEST_MS: i64 = 946_684_800_000;
 
-/// The newest `limit` bars of `interval` that open from `start_ms` to `end_ms` (or now), oldest
+/// The newest `limit` bars of `bar` that open from `start_ms` to `end_ms` (or now), oldest
 /// first.
 fn fetch_bars(
     symbol: &str,
-    interval: &str,
+    bar: Timeframe,
     start_ms: i64,
     end_ms: Option<i64>,
     limit: usize,
@@ -224,9 +221,9 @@ fn fetch_bars(
     let mut url = format!(
         "{BARS_URL}/{}/bars?timeframe={}&start={}&limit={}&adjustment=all&feed=iex&sort=desc",
         symbol.to_uppercase(),
-        timeframe(interval),
+        token(bar),
         crate::format::iso8601(start_ms),
-        limit.clamp(1, 10_000)
+        limit.clamp(1, MAX_BARS)
     );
     if let Some(end_ms) = end_ms {
         url.push_str(&format!("&end={}", crate::format::iso8601(end_ms)));
@@ -237,7 +234,7 @@ fn fetch_bars(
         crate::service::net::http::Retry::Transient,
     )
     .map_err(ProviderError::Alpaca)?;
-    let mut bars = parse_bars(&body)?;
+    let mut bars = parse_bars(&body, bar)?;
     // The newest page of a market with no bars at all is an error; an older page with none is
     // the start of its history.
     if bars.is_empty() && end_ms.is_none() {
@@ -251,7 +248,7 @@ fn fetch_bars(
 }
 
 /// `{"bars": [{"t": ISO, "o", "h", "l", "c", "v", "vw"}]}` newest first.
-fn parse_bars(body: &str) -> Result<Vec<Kline>, ProviderError> {
+fn parse_bars(body: &str, length: Timeframe) -> Result<Vec<Kline>, ProviderError> {
     let value: Value = serde_json::from_str(body).map_err(ProviderError::data)?;
     let bars = value
         .get("bars")
@@ -272,7 +269,7 @@ fn parse_bars(body: &str) -> Result<Vec<Kline>, ProviderError> {
         let volume = bar.get("v").and_then(Value::as_f64).unwrap_or(0.0);
         out.push(Kline {
             open_time: t,
-            close_time: t,
+            close_time: close_ms(length, t),
             open: o,
             high: h,
             low: l,
@@ -363,11 +360,107 @@ mod tests {
                 volume: 1.0,
             },
         ];
-        let folded = fold_calendar(&bars, 7_776_000, false);
+        let folded = bucket::fold(&bars, Timeframe::MONTH_3, false);
         assert_eq!(folded.len(), 2);
         assert_eq!(folded[0].open_time, jan);
         assert_eq!(folded[0].high, 12.0);
         assert_eq!(folded[0].low, 9.0);
         assert_eq!(folded[1].open_time, apr);
+    }
+
+    fn day_ms(year: i64, month: i64, day: i64) -> i64 {
+        crate::format::days_from_civil(year, month, day) * DAY_MS
+    }
+
+    fn one_bar(time: &str) -> String {
+        format!(r#"{{"bars":[{{"t":"{time}","o":1,"h":2,"l":0.5,"c":1.5,"v":10}}]}}"#)
+    }
+
+    #[test]
+    fn an_hourly_bar_closes_a_millisecond_before_the_next_hour() {
+        let bars = parse_bars(&one_bar("2026-10-09T14:00:00Z"), Timeframe::HOUR_1).unwrap();
+        assert_eq!(bars[0].close_time, bars[0].open_time + 3_600_000 - 1);
+    }
+
+    #[test]
+    fn a_daily_bar_keeps_alpacas_new_york_midnight_offset() {
+        let bars = parse_bars(&one_bar("2026-10-09T04:00:00Z"), Timeframe::DAY_1).unwrap();
+        assert_eq!(bars[0].open_time, day_ms(2026, 10, 9) + 4 * 3_600_000);
+        assert_eq!(bars[0].close_time, day_ms(2026, 10, 10) + 4 * 3_600_000 - 1);
+    }
+
+    #[test]
+    fn a_monthly_bar_closes_before_the_next_month_opens() {
+        let bars = parse_bars(&one_bar("2026-11-01T04:00:00Z"), Timeframe::MONTH_1).unwrap();
+        assert_eq!(bars[0].close_time, day_ms(2026, 12, 1) + 4 * 3_600_000 - 1);
+        let february = parse_bars(&one_bar("2024-02-01T05:00:00Z"), Timeframe::MONTH_1).unwrap();
+        assert_eq!(
+            february[0].close_time,
+            day_ms(2024, 3, 1) + 5 * 3_600_000 - 1,
+            "a leap February has 29 days"
+        );
+        let december = parse_bars(&one_bar("2026-12-01T05:00:00Z"), Timeframe::MONTH_1).unwrap();
+        assert_eq!(
+            december[0].close_time,
+            day_ms(2027, 1, 1) + 5 * 3_600_000 - 1
+        );
+    }
+
+    #[test]
+    fn a_weekly_bar_spans_seven_days() {
+        let bars = parse_bars(&one_bar("2026-10-05T04:00:00Z"), Timeframe::WEEK_1).unwrap();
+        assert_eq!(bars[0].close_time, bars[0].open_time + 7 * DAY_MS - 1);
+    }
+
+    #[test]
+    fn natives_map_to_alpacas_own_tokens() {
+        let tokens: Vec<String> = DataSource::Alpaca
+            .natives()
+            .iter()
+            .map(|native| token(*native))
+            .collect();
+        assert_eq!(
+            tokens,
+            [
+                "1Min", "5Min", "15Min", "30Min", "1Hour", "1Day", "1Week", "1Month"
+            ]
+        );
+    }
+
+    fn request(timeframe: &str, limit: usize) -> (String, usize) {
+        let plan = plan(DataSource::Alpaca, Timeframe::parse(timeframe).unwrap()).unwrap();
+        (token(plan.base()), plan.base_count(limit))
+    }
+
+    #[test]
+    fn other_lengths_fold_the_coarsest_native_that_nests() {
+        assert_eq!(request("1h", 100), ("1Hour".to_owned(), 100));
+        assert_eq!(request("4h", 100), ("1Hour".to_owned(), 101 * 4));
+        // 3Hour and 20Min exist on Alpaca but are not on our grid: a fold of the hour is.
+        assert_eq!(request("3h", 100), ("1Hour".to_owned(), 101 * 3));
+        assert_eq!(request("45m", 100), ("15Min".to_owned(), 101 * 3));
+        assert_eq!(request("22m", 100), ("1Min".to_owned(), 101 * 22));
+        assert_eq!(request("2d", 100), ("1Day".to_owned(), 101 * 2));
+        assert_eq!(request("2w", 100), ("1Week".to_owned(), 101 * 2));
+        assert_eq!(request("3M", 100), ("1Month".to_owned(), 101 * 3));
+        assert_eq!(request("1Y", 500), ("1Month".to_owned(), 501 * 12));
+    }
+
+    #[test]
+    fn the_newest_few_intraday_bars_look_back_over_a_long_weekend() {
+        let now = day_ms(2026, 10, 12) + 12 * 3_600_000;
+        let start = lookback_start_ms(Timeframe::HOUR_1, 4, now);
+        assert_eq!(now - start, 7 * DAY_MS);
+        let daily = lookback_start_ms(Timeframe::DAY_1, 4, now);
+        assert_eq!(now - daily, 8 * DAY_MS);
+    }
+
+    #[test]
+    fn a_deep_lookback_stops_where_alpacas_data_begins() {
+        let now = day_ms(2026, 10, 12);
+        assert_eq!(
+            lookback_start_ms(Timeframe::MONTH_1, 6_012, now),
+            EARLIEST_MS
+        );
     }
 }

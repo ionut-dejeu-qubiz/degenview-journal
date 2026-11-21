@@ -13,6 +13,8 @@ Always read [Core guidance](docs/agent-guides/core.md), then every guide whose s
 | The symbol picker (⌘K, Add Chart and a watchlist's plus: markets, prediction markets, indices and portfolio cards), symbol search ranking, or how markets are named | [Symbol picker](docs/symbol-picker.md) |
 | Any UI: a new or restyled window, sheet, panel, card, sidebar, icon, menu, button, link or dialog | [UI style](docs/agent-guides/ui-style.md) |
 | Chart rendering, price labels, chart types, canvas, templates, drawings, portfolio cards, or snapshots | [Charts](docs/agent-guides/charts.md) |
+| The cursor menu (Cross, Dot, Arrow, Demonstration, Eraser), the crosshair's parts, the pointer shape over a plot, or the values tooltip on long press | [Chart cursors](docs/chart-cursors.md) |
+| The Screenshot Studio, Select portion, snapshot compositions or backgrounds, or the camera menu | [Chart snapshots](docs/snapshots.md) |
 | Markets compared on a chart (Compare, overlays), their data, scales, legend or the picker's compare mode | [Chart overlays](docs/chart-overlays.md) |
 | The Portfolio tab: Overview, Holdings, Transactions, Statistics, their empty states, or portfolio revaluation | [Portfolio page](docs/portfolio-page.md) |
 | Text, note, table, image or post drawings | [Annotation tools](docs/annotation-tools.md) |
@@ -32,6 +34,7 @@ Always read [Core guidance](docs/agent-guides/core.md), then every guide whose s
 | The AI assistant, LLM providers, or the AI API keys | [AI assistant](docs/ai-assistant.md) |
 | Price/Pine alerts or webhooks | [Alerts and webhooks](docs/agent-guides/alerts-webhooks.md) |
 | Tab Linking: colour-tagged tabs that share symbol, interval, time or date range across windows | [Tab Linking](docs/tab-linking.md) |
+| Proxies, VPN "system proxy", `HTTP(S)_PROXY`, building an HTTP agent, WebSocket connections, or Settings ▸ Network | [Network proxy](docs/network-proxy.md) |
 | Tabs, windows, workspaces, saved layouts, session state, or app-wide state | [Tabs and state](docs/agent-guides/tabs-state.md) |
 | MCP server, tools, permissions, or clients | [MCP](docs/agent-guides/mcp.md) |
 | Releases, signing, packaging, self-update, or update UI | [Releases and updates](docs/agent-guides/releases-updates.md) |
@@ -125,6 +128,7 @@ old output). Finished worktrees are where the disk goes.
 
 - [Architecture](docs/architecture.md) — module map, data flow.
 - [Chart types](docs/chart-types.md) — construction rules, Pine semantics.
+- [Chart cursors](docs/chart-cursors.md) — the cursor modes and the capability table that decides what each shows.
 - [Chart navigation](docs/chart-navigation.md) — viewport, pan/axis gestures, older history, unverified items.
 - [Price scale modes](docs/price-scale.md) — Regular, Percent, Indexed to 100, Logarithmic; reference price, ticks, corner menu, persistence.
 - [Linked charts](docs/chart-sync.md) — position/zoom sync between a workspace's charts.
@@ -135,7 +139,8 @@ old output). Finished worktrees are where the disk goes.
 - [Pine Logs](docs/pine-logs.md) — `log.*()` messages: sink, limits, batches, TradingView verification.
 - [Portfolio cards](docs/portfolio-cards.md) — card design, known gaps.
 - [New-tab page](docs/new-tab-page.md) — the blank tab: search launcher, tabs, sparklines, animated backdrop.
-- [Chart snapshots](docs/snapshots.md) — camera menu, shared renderer, hosted sharing via providers (ImgBB, your own host, adding one), privacy.
+- [README hero GIF](tools/readme-gif/README.md): how the animated picture is recorded from the real app, and when to retake it.
+- [Chart snapshots](docs/snapshots.md) — camera menu, shared renderer, Screenshot Studio (Select portion, composer, backdrops, remembered look), hosted sharing via providers (ImgBB, your own host, adding one), privacy.
 - [MCP implementation](docs/mcp-implementation.md) and [remaining work](docs/mcp-remaining-work.md).
 - Also in Required reading, with details and what is verified versus decided:
   [Live trading](docs/broker-trading.md), [iCloud Sync](docs/icloud-sync.md),
@@ -149,4 +154,4 @@ old output). Finished worktrees are where the disk goes.
   [Pine debugger](docs/pine-debugger.md), [Pine profiler](docs/pine-profiler.md),
   [Editor themes](docs/editor-themes.md), [User-defined methods](docs/pine-user-methods.md),
   [Pine volume footprints](docs/pine-footprint.md), [AI assistant](docs/ai-assistant.md),
-  [Portfolio page](docs/portfolio-page.md).
+  [Portfolio page](docs/portfolio-page.md), [Network proxy](docs/network-proxy.md).

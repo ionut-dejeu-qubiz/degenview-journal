@@ -21,7 +21,7 @@ every six hours, then exposes availability, byte progress, failure, and restart 
   asks for a repaint when it ends. Picker searches go through `start_search` (CoinGecko and
   GeckoTerminal on their rate-limit lanes, the rest on search workers apart from candle fetches);
   other provider requests through `start_for`; dialogs and Keychain reads use `SNAPSHOTS`.
-- `BinanceLiveFeed`, `WatchlistQuoteCoordinator`, and Coinbase's ticker socket own reconnecting
+- `LiveFeed` (candle sockets), `WatchlistQuoteCoordinator` and its ticker sockets own reconnecting
   threads and channels. Hidden/occluded workspaces suspend feeds.
 - App-wide state uses `Arc<Mutex<...>>`, held by the app's parts, which hand each window callback
   one cheap `Clone` handle (see [Modules](modules.md)); per-tab content is `Arc<Mutex<TabContent>>`.
@@ -32,7 +32,7 @@ every six hours, then exposes availability, byte progress, failure, and restart 
 1. A market chart owns symbol/source, candles, fetch state, and `ChartCard`.
 2. `service::for_source` selects `MarketSource`; results are cached by source/symbol/interval.
 3. Binance streams replace the forming candle; five-second REST refresh covers other providers and
-   recovery. `merge_fetched_candles` rejects older snapshots.
+   recovery. `model::market::live` folds both: it drops an older kline and keeps live bars over a REST snapshot.
 4. Indicators compute over full history, trim to the visible tail, then render through
    `egui::Painter`.
 

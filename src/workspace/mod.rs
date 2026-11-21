@@ -10,7 +10,7 @@ use crate::model::{
     BuiltIn, ChartColumn, ChartSyncSettings, DataSource, Drawing, DrawingCommand, InstrumentId,
     Timeframe,
 };
-use crate::service::market::live::BinanceLiveFeed;
+use crate::service::market::live::LiveFeed;
 use crate::service::watchlist_quotes::{WatchlistQuoteBook, WatchlistQuoteCoordinator};
 use crate::store::SharedStore;
 use crate::store::watchlist::WatchlistStore;
@@ -164,7 +164,7 @@ pub struct ChartWorkspace {
     symbol_picker: SymbolPicker,
     /// How portfolio cards reach the app's portfolios; set by the window that draws this tab.
     card_env: Option<PortfolioCardEnv>,
-    live_feed: Option<BinanceLiveFeed>,
+    live_feeds: HashMap<DataSource, LiveFeed>,
     /// The candles of every overlay market on this workspace's charts, fetched once per market.
     overlay_hub: overlay::OverlayHub,
     settings_chart: Option<u64>,
@@ -229,7 +229,7 @@ impl ChartWorkspace {
         if let Some(card) = item.card {
             let mut workspace = Self::empty(
                 id,
-                Timeframe::Day,
+                Timeframe::DAY_1,
                 watchlist,
                 quote_book,
                 quote_coordinator,
@@ -243,7 +243,7 @@ impl ChartWorkspace {
             id,
             &item.instrument.symbol,
             item.instrument.source,
-            Timeframe::Day,
+            Timeframe::DAY_1,
             watchlist,
             quote_book,
             quote_coordinator,
@@ -301,7 +301,7 @@ impl ChartWorkspace {
             indicator_picker: IndicatorPicker::new(Some(store.clone())),
             symbol_picker: SymbolPicker::new(store.clone()),
             card_env: None,
-            live_feed: None,
+            live_feeds: HashMap::new(),
             overlay_hub: overlay::OverlayHub::new(),
             settings_chart: None,
             script_popover: None,
@@ -567,17 +567,14 @@ impl ChartWorkspace {
             chart.receive_fetch();
             chart.receive_older(timeframe);
             chart.request_older(timeframe, &ctx);
-            if chart.is_market()
-                && chart.inbox.is_none()
-                && chart.last_fetch.elapsed() >= chart.refresh_after()
-            {
+            if chart.refresh_due() {
                 chart.fetch(timeframe, &ctx);
             }
         }
 
         self.tick_link_probation(&ctx);
         self.tick_overlays(&ctx);
-        self.update_live_feed(&ctx);
+        self.update_live_feeds(&ctx);
         {
             let mut host = lock(paper);
             self.sync_paper_quotes(&mut host);
@@ -715,6 +712,8 @@ impl ChartWorkspace {
             self.confirm_chart_removal(&ctx, chart_id);
         }
         actions.extend(self.show_alert_editor(&ctx));
+        // Before the notices (in the context UI), so a result is drawn over the window.
+        self.show_studio(&ctx);
         actions.extend(self.show_context_ui(&ctx, &mut lock(paper)));
         actions.extend(self.take_logs_actions());
         self.show_replay_date_sheet(&ctx);
@@ -811,7 +810,7 @@ mod tests {
     fn persisted_workspace_round_trips() {
         let saved = PersistedWorkspace {
             id: 7,
-            timeframe: Timeframe::Hour,
+            timeframe: Timeframe::HOUR_1,
             watchlist_visible: false,
             charts: vec![
                 PersistedChart {
@@ -823,7 +822,7 @@ mod tests {
                     y_zoom: 1.0,
                     indicators: IndicatorConfig::default(),
                     appearance: crate::model::ChartAppearance::default(),
-                    drawings: Vec::new(),
+                    drawings: Default::default(),
                     pine_instances: Vec::new(),
                     candle_count: 0,
                     viewport: Default::default(),
@@ -862,7 +861,7 @@ mod tests {
                             ..crate::model::ChartCanvas::default()
                         },
                     },
-                    drawings: Vec::new(),
+                    drawings: Default::default(),
                     pine_instances: vec![crate::model::pine::instance::PineInstance::new(
                         1,
                         Some("s".into()),

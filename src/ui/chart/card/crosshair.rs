@@ -1,8 +1,32 @@
 //! The crosshair: its lines and tags, and the readout naming the bar under it.
 
 use super::*;
+use crate::model::chart::sync::TimeAxis;
+use crate::model::chart::viewport::zoom::Slots;
 
 impl ChartCard {
+    /// Where the crosshair's column lies on this chart's plot. The owner's is under its pointer.
+    /// Any other chart's is at the same instant, wherever that falls on its own bars; a chart
+    /// without a time scale, or one that does not reach the instant on screen, has none.
+    pub(super) fn crosshair_column(
+        &self,
+        crosshair: &CrosshairInfo,
+        chart_id: u64,
+        source: DataSource,
+        plot: Rect,
+        slots: Slots,
+        bars: &[Kline],
+    ) -> Option<f32> {
+        if crosshair.owner_id == chart_id {
+            return Some(plot.left() + plot.width() * crosshair.x_fraction as f32);
+        }
+        if !self.takes_part_in_sync(source) {
+            return None;
+        }
+        let x = slots.x(TimeAxis::new(bars).x_at(crosshair.time?)?);
+        plot.x_range().contains(x).then_some(x)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_crosshair(
         &self,
@@ -12,6 +36,7 @@ impl ChartCard {
         pane_rects: &[Rect],
         crosshair: &CrosshairInfo,
         chart_id: u64,
+        x: f32,
         scale: &PriceScale,
         candles: &[Kline],
         slot_width: f32,
@@ -22,14 +47,17 @@ impl ChartCard {
         info: &CrosshairBars,
     ) {
         let line = style.crosshair;
-        let x = plot.left() + plot.width() * crosshair.x_fraction as f32;
+        let caps = self.cursor.caps();
 
         // Vertical line — every chart draws it at the shared column, through the price chart and
         // on through each script pane under it.
-        if main_visible && !crosshair.frozen {
+        if caps.lines && main_visible && !crosshair.frozen {
             canvas::vertical(painter, x, (plot.top(), plot.bottom()), line);
         }
-        for pane in pane_rects.iter().filter(|_| !crosshair.frozen) {
+        for pane in pane_rects
+            .iter()
+            .filter(|_| caps.lines && !crosshair.frozen)
+        {
             if pane.height() > crate::model::chart::canvas::COLLAPSED_PANE_HEIGHT {
                 canvas::vertical(painter, x, (pane.top(), pane.bottom()), line);
             }
@@ -39,21 +67,25 @@ impl ChartCard {
         if main_visible && crosshair.owner_id == chart_id && !crosshair.frozen {
             let y = scale.y(crosshair.price);
             if plot.y_range().contains(y) {
-                canvas::horizontal(painter, (plot.left(), plot.right()), y, line);
-                let half = style.tag_half_height();
-                let price_tag = Rect::from_min_max(
-                    Pos2::new(plot.right() + 3.0, y - half),
-                    Pos2::new(rect.right() - 3.0, y + half),
-                );
-                painter.rect_filled(price_tag, 3.0, Color32::from_gray(79));
-                price_text::paint(
-                    painter,
-                    price_tag.center(),
-                    Align2::CENTER_CENTER,
-                    &scale.tag_label(self.appearance.price_format(), crosshair.price),
-                    style.price_font(),
-                    Color32::WHITE,
-                );
+                if caps.lines {
+                    canvas::horizontal(painter, (plot.left(), plot.right()), y, line);
+                }
+                if caps.axis_tags {
+                    let half = style.tag_half_height();
+                    let price_tag = Rect::from_min_max(
+                        Pos2::new(plot.right() + 3.0, y - half),
+                        Pos2::new(rect.right() - 3.0, y + half),
+                    );
+                    painter.rect_filled(price_tag, 3.0, Color32::from_gray(79));
+                    price_text::paint(
+                        painter,
+                        price_tag.center(),
+                        Align2::CENTER_CENTER,
+                        &scale.tag_label(self.appearance.price_format(), crosshair.price),
+                        style.price_font(),
+                        Color32::WHITE,
+                    );
+                }
             }
         }
 
@@ -65,7 +97,7 @@ impl ChartCard {
             return;
         };
 
-        if !crosshair.frozen {
+        if caps.axis_tags && !crosshair.frozen {
             let date = format::timestamp(candle.open_time);
             let time_tag_width = 116.0 * style.time_size / 9.0;
             let time_tag = Rect::from_center_size(
@@ -88,14 +120,37 @@ impl ChartCard {
 
         // The header covers the plot's top, so the readouts start under it.
         let below_header = self.below_header(plot);
-        let readout_bottom = if style.ohlc_readout {
-            self.draw_readout(painter, below_header, info, index, candle, show_volume)
+        let readout_bottom = if style.ohlc_readout && caps.readout {
+            let previous_close = match index.checked_sub(1) {
+                Some(before) => Some(candles[before].close),
+                None => info.previous_close,
+            };
+            self.draw_readout(
+                painter,
+                below_header,
+                info,
+                (index, candle, previous_close),
+                show_volume,
+            )
         } else {
             below_header.top() - 4.0
         };
         let (overlay_frame, overlay_view) = info.overlays;
         self.paint_overlay_rings(painter, below_header, overlay_frame, overlay_view, index, x);
         overlay_card::remember(painter.ctx(), chart_id, index, readout_bottom);
+        if self.shows_values_tooltip() && crosshair.owner_id == chart_id && !crosshair.frozen {
+            let previous_close = match index.checked_sub(1) {
+                Some(before) => Some(candles[before].close),
+                None => info.previous_close,
+            };
+            self.draw_values_tooltip(
+                painter,
+                plot,
+                info,
+                (index, candle, previous_close),
+                show_volume,
+            );
+        }
 
         // Line, area and baseline charts follow one value: ring it on the bar under the pointer.
         if info.chart_type.data_class() == DataClass::StandardLine
@@ -127,15 +182,23 @@ impl ChartCard {
         painter: &egui::Painter,
         plot: Rect,
         info: &CrosshairBars,
+        bar: (usize, &Kline, Option<f64>),
+        show_volume: bool,
+    ) -> f32 {
+        let color = self.bar_color(bar.1, bar.2);
+        let items = self.readout_rows(info, bar.0, bar.1, show_volume);
+        paint_ohlc_readout(painter, plot, &items, color)
+    }
+
+    /// The `(label, value)` pairs naming the bar at `index`: what the box in the corner shows, and
+    /// the first rows of the values tooltip.
+    pub(super) fn readout_rows(
+        &self,
+        info: &CrosshairBars,
         index: usize,
         candle: &Kline,
         show_volume: bool,
-    ) -> f32 {
-        let color = if candle.is_up() {
-            self.bullish_color()
-        } else {
-            self.bearish_color()
-        };
+    ) -> Vec<(String, String)> {
         let constructed = info.synthetic.and_then(|bars| bars.get(index));
         let price_format = self.appearance.price_format();
         let mut items = readout_items(info, constructed, candle, price_format);
@@ -186,7 +249,7 @@ impl ChartCard {
                 ));
             }
         }
-        paint_ohlc_readout(painter, plot, &items, color)
+        items
     }
 }
 
@@ -195,6 +258,8 @@ impl ChartCard {
 pub(super) struct CrosshairBars<'a> {
     pub(super) chart_type: ChartType,
     pub(super) synthetic: Option<&'a [SyntheticBar]>,
+    /// The close of the bar before the first one in view, for colouring by the previous close.
+    pub(super) previous_close: Option<f64>,
     /// The market's own candles, whole.
     pub(super) source_candles: &'a [Kline],
     /// The scripts drawing on the chart: their `plotcandle()` and `plotbar()` values show too.
@@ -204,6 +269,12 @@ pub(super) struct CrosshairBars<'a> {
     pub(super) tail: usize,
     /// The comparison lines, and the view they were resolved for.
     pub(super) overlays: (&'a overlays::OverlayFrame<'a>, &'a View),
+    /// The built-in indicators over the bars in view, already computed for the frame, and the
+    /// settings they were computed with.
+    pub(super) indicators: &'a IndicatorSeries,
+    pub(super) indicator_config: &'a IndicatorConfig,
+    /// The scripts with a pane of their own, whose plots the values tooltip lists too.
+    pub(super) pane_pine: Vec<&'a VisualOutput>,
 }
 
 /// The crosshair's values for one bar. A candle chart reads open, high, low and close; a

@@ -203,6 +203,7 @@ pub(super) fn show_tab(
                     PineStudioAction::OpenAlpacaSettings => AppAction::OpenAlpacaSettings,
                     PineStudioAction::OpenWebhookSettings => AppAction::OpenWebhookSettings,
                     PineStudioAction::OpenAiSettings => AppAction::OpenAiSettings,
+                    PineStudioAction::OpenEditorThemeSettings => AppAction::OpenEditorThemeSettings,
                 }));
             }
         }
@@ -263,7 +264,7 @@ impl SharedTabs {
                 workspace.link(),
                 true,
             ),
-            _ => (None, "", None, false),
+            _ => (None, String::new(), None, false),
         };
         Some(TabView {
             id: tab,
@@ -605,7 +606,7 @@ impl DegenViewApp {
         let id = self.tabs.allocate_id();
         let slot = TabSlot::new(TabContent::Chart(Box::new(ChartWorkspace::empty(
             id,
-            Timeframe::Day,
+            Timeframe::DAY_1,
             Arc::clone(&self.watchlist),
             self.quote_book.clone(),
             self.quote_coordinator.clone(),

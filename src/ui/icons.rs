@@ -10,7 +10,6 @@ use eframe::egui::{
 /// The glyph set the app draws.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Icon {
-    SidebarLeft,
     ChartLine,
     ChartLineFlat,
     ChartUptrend,
@@ -98,6 +97,7 @@ pub enum Icon {
     ArrowDown,
     /// The return key's bent arrow: down, then left.
     Return,
+    Shift,
     Pencil,
     PauseFill,
     PlayFill,
@@ -146,6 +146,8 @@ pub enum Icon {
     Shield,
     /// A hexagon outline, a stop sign: the Stop order type.
     StopSign,
+    /// A globe: the network.
+    Globe,
     LockFill,
     SplitColumns,
     Tag,
@@ -164,6 +166,8 @@ pub enum Icon {
     Minus,
     RectFill,
     RectDashed,
+    /// Four corner brackets: an area to select.
+    SelectArea,
     Undo,
     /// Undo's mirror image.
     Redo,
@@ -252,6 +256,22 @@ pub enum Icon {
     StopFill,
     Restart,
     Bug,
+    /// A zig-zag line: what a chart's indicators draw.
+    Indicators,
+    /// A frame with a small mark and a line at its foot: the signature on an image.
+    Branding,
+    /// A circular arrow turning back: Restart's mirror image.
+    ResetView,
+    /// The Cross cursor: a thin plus with the pointer's own gap at its centre.
+    CursorCross,
+    /// The Dot cursor: one small solid dot.
+    CursorDot,
+    /// The Arrow cursor: the classic pointer, outlined.
+    CursorArrow,
+    /// The Demonstration cursor: a ring around a dot, the spot a presenter points with.
+    CursorDemonstration,
+    /// The Eraser cursor: a slanted block with its lower half struck solid, over a baseline.
+    CursorEraser,
 }
 
 /// Stroke width on the 16 grid.
@@ -427,15 +447,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[p(3.0, 6.0), p(4.0, 6.0)]);
             line(&[p(12.0, 10.0), p(13.0, 10.0)]);
         }
-        Icon::SidebarLeft => {
-            painter.rect_stroke(
-                rect_of(p(1.5, 2.5), p(14.5, 13.5)),
-                round(2.5),
-                stroke,
-                StrokeKind::Middle,
-            );
-            line(&[p(6.0, 2.8), p(6.0, 13.2)]);
-        }
         Icon::ChartLine | Icon::ChartLineFlat => {
             line(&[p(2.0, 2.0), p(2.0, 14.0), p(14.0, 14.0)]);
             if icon == Icon::ChartLine {
@@ -483,6 +494,20 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 line(&[p(a.0, a.1), p(b.0, b.1)]);
             }
         }
+        Icon::SelectArea => {
+            for (corner, along, down) in [
+                ((2.0, 3.0), 1.0, 1.0),
+                ((14.0, 3.0), -1.0, 1.0),
+                ((2.0, 13.0), 1.0, -1.0),
+                ((14.0, 13.0), -1.0, -1.0),
+            ] {
+                line(&[
+                    p(corner.0 + along * 4.0, corner.1),
+                    p(corner.0, corner.1),
+                    p(corner.0, corner.1 + down * 4.0),
+                ]);
+            }
+        }
         Icon::Undo => {
             line(&[p(5.6, 2.8), p(2.6, 5.8), p(5.6, 8.8)]);
             let mut bow = vec![p(2.8, 5.8)];
@@ -515,6 +540,39 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Plus => {
             line(&[p(8.0, 3.0), p(8.0, 13.0)]);
             line(&[p(3.0, 8.0), p(13.0, 8.0)]);
+        }
+        Icon::CursorCross => {
+            line(&[p(8.0, 1.8), p(8.0, 6.0)]);
+            line(&[p(8.0, 10.0), p(8.0, 14.2)]);
+            line(&[p(1.8, 8.0), p(6.0, 8.0)]);
+            line(&[p(10.0, 8.0), p(14.2, 8.0)]);
+        }
+        Icon::CursorDot => circle(p(8.0, 8.0), 2.6, true),
+        Icon::CursorArrow => closed(&[
+            p(3.6, 2.0),
+            p(3.6, 13.0),
+            p(6.4, 10.2),
+            p(8.6, 14.4),
+            p(10.6, 13.5),
+            p(8.5, 9.4),
+            p(12.4, 9.4),
+        ]),
+        Icon::CursorDemonstration => {
+            circle(p(8.0, 8.0), 6.0, false);
+            circle(p(8.0, 8.0), 2.0, true);
+        }
+        Icon::CursorEraser => {
+            closed(&[
+                p(2.4, 9.4),
+                p(8.6, 3.2),
+                p(13.2, 7.8),
+                p(7.0, 14.0),
+                p(5.6, 14.0),
+                p(2.4, 10.8),
+            ]);
+            line(&[p(5.4, 6.6), p(10.0, 11.2)]);
+            fill_poly(vec![p(5.4, 6.6), p(10.0, 11.2), p(7.0, 14.0), p(2.4, 9.4)]);
+            line(&[p(8.4, 14.2), p(14.4, 14.2)]);
         }
         Icon::PlusCircle => {
             circle(p(8.0, 8.0), 6.4, false);
@@ -986,6 +1044,16 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[p(12.5, 3.0), p(12.5, 9.0), p(3.5, 9.0)]);
             line(&[p(6.5, 6.0), p(3.5, 9.0), p(6.5, 12.0)]);
         }
+        // The shift key's outline: an arrow pointing up with a short stem.
+        Icon::Shift => closed(&[
+            p(8.0, 2.4),
+            p(13.4, 8.2),
+            p(10.0, 8.2),
+            p(10.0, 13.4),
+            p(6.0, 13.4),
+            p(6.0, 8.2),
+            p(2.6, 8.2),
+        ]),
         Icon::Pencil => {
             closed(&[
                 p(10.6, 2.4),
@@ -2024,6 +2092,32 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&arc(8.0, 8.0, 5.4, 30.0, 330.0));
             line(&[p(13.5, 1.9), p(13.2, 5.0), p(10.0, 4.7)]);
         }
+        Icon::Indicators => line(&[
+            p(1.5, 11.5),
+            p(5.0, 5.0),
+            p(8.2, 9.8),
+            p(11.0, 4.2),
+            p(14.5, 8.5),
+        ]),
+        Icon::Branding => {
+            painter.rect_stroke(
+                rect_of(p(1.6, 2.8), p(14.4, 13.2)),
+                round(2.0),
+                stroke,
+                StrokeKind::Middle,
+            );
+            circle(p(4.9, 10.1), 1.15, true);
+            line(&[p(7.6, 10.1), p(11.4, 10.1)]);
+        }
+        Icon::ResetView => {
+            let flip = |q: Pos2| pos2(2.0 * (origin.x + 8.0 * scale) - q.x, q.y);
+            let ring: Vec<Pos2> = arc(8.0, 8.0, 5.4, 30.0, 330.0)
+                .into_iter()
+                .map(flip)
+                .collect();
+            line(&ring);
+            line(&[p(13.5, 1.9), p(13.2, 5.0), p(10.0, 4.7)].map(flip));
+        }
         Icon::Bug => {
             // The classic: a round body with a head, six legs and two feelers.
             circle(p(8.0, 9.4), 3.3, false);
@@ -2256,6 +2350,19 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 p(2.8, 3.6),
             ]);
         }
+        Icon::Globe => {
+            circle(p(8.0, 8.0), 6.4, false);
+            line(&[p(1.6, 8.0), p(14.4, 8.0)]);
+            line(&[p(2.4, 5.2), p(13.6, 5.2)]);
+            line(&[p(2.4, 10.8), p(13.6, 10.8)]);
+            let meridian: Vec<Pos2> = (0..=24)
+                .map(|k| {
+                    let a = k as f32 / 24.0 * std::f32::consts::TAU;
+                    p(8.0 + 3.0 * a.cos(), 8.0 + 6.4 * a.sin())
+                })
+                .collect();
+            closed(&meridian);
+        }
         Icon::StopSign => {
             let hexagon: Vec<Pos2> = (0..6)
                 .map(|k| {
@@ -2334,7 +2441,6 @@ mod tests {
     fn every_icon_paints_shapes() {
         use Icon::*;
         let all = [
-            SidebarLeft,
             ChartLine,
             ChartLineFlat,
             ChartUptrend,
@@ -2410,6 +2516,7 @@ mod tests {
             ArrowUp,
             ArrowDown,
             Return,
+            Shift,
             Pencil,
             PauseFill,
             PlayFill,
@@ -2453,6 +2560,7 @@ mod tests {
             Target,
             Shield,
             StopSign,
+            Globe,
             LockFill,
             SplitColumns,
             Tag,
@@ -2469,6 +2577,7 @@ mod tests {
             Minus,
             RectFill,
             RectDashed,
+            SelectArea,
             Undo,
             Redo,
             Rewind,
@@ -2553,6 +2662,14 @@ mod tests {
             StopFill,
             Restart,
             Bug,
+            Indicators,
+            Branding,
+            ResetView,
+            CursorCross,
+            CursorDot,
+            CursorArrow,
+            CursorDemonstration,
+            CursorEraser,
         ];
         for icon in all {
             let ctx = egui::Context::default();

@@ -2,6 +2,7 @@
 
 pub(in crate::workspace) mod collection;
 pub(in crate::workspace) mod context;
+mod drawing_sets;
 pub(in crate::workspace) mod live;
 pub(in crate::workspace) mod settings;
 pub(in crate::workspace) mod snapshot;
@@ -10,8 +11,10 @@ pub(in crate::workspace) mod symbol_picker;
 use super::PersistedChart;
 use crate::host::portfolio::card::CardRuntime;
 use crate::model::chart::price_scale::PriceScaleMode;
+use crate::model::drawings::market::MarketDrawings;
 use crate::model::market;
 use crate::model::market::history::OlderHistory;
+use crate::model::market::live::{LiveFold, LiveMark};
 use crate::model::overlay::OverlayList;
 use crate::model::portfolio::card::PortfolioCard;
 use crate::model::watchlist::WatchlistInstrument;
@@ -48,13 +51,20 @@ pub(super) struct Chart {
     pub(super) chart: ChartCard,
     pub(super) scale_mode: PriceScaleMode,
     pub(super) indicators: IndicatorConfig,
+    /// The drawings of the market the chart shows ([`drawing_sets`]).
     pub(super) drawings: Vec<Drawing>,
+    /// The drawings of the markets the chart showed before, by market key.
+    pub(super) parked_drawings: MarketDrawings,
+    /// The next id a drawing takes: one counter for every market, ids being unique per chart.
     pub(super) next_drawing_id: u64,
     pub(super) last_paper_quote: Option<(f64, Instant)>,
     /// Wall-clock time (epoch ms) the candles last arrived from the provider or its live feed.
     /// Paper trading stamps its quotes with this, never with the time they are read.
     pub(super) last_data_ms: Option<i64>,
-    pub(super) last_live_open_time: Option<i64>,
+    /// The newest bar the live feed delivered: a refresh begun before it keeps it.
+    pub(super) live: Option<LiveMark>,
+    /// The live klines of the bucket forming, when the timeframe is folded from finer ones.
+    pub(super) live_fold: LiveFold,
     /// Prediction markets: the choices charted together as lines, when there are several.
     pub(super) pm_series: Vec<PmSeries>,
     /// Markets compared on this chart, in visual order. Configuration only: their candles live in
@@ -133,10 +143,12 @@ impl Chart {
             scale_mode: PriceScaleMode::default(),
             indicators: IndicatorConfig::default(),
             drawings: Vec::new(),
+            parked_drawings: MarketDrawings::default(),
             next_drawing_id: 1,
             last_paper_quote: None,
             last_data_ms: None,
-            last_live_open_time: None,
+            live: None,
+            live_fold: LiveFold::default(),
             pm_series: Vec::new(),
             overlays: OverlayList::new(),
             image_url: None,
@@ -181,6 +193,11 @@ impl Chart {
         match self.source {
             DataSource::Binance
             | DataSource::Coinbase
+            | DataSource::Okx
+            | DataSource::Kraken
+            | DataSource::Bybit
+            | DataSource::Gate
+            | DataSource::Mexc
             | DataSource::CoinGecko
             | DataSource::Alpaca => self.source.display_symbol(&self.symbol),
             DataSource::DexScreener => self.source.base_asset(&self.display_title()),
@@ -212,10 +229,12 @@ impl Chart {
     /// Replaces the market-specific state while preserving this card's presentation settings.
     /// A market that takes no indicators leaves the chart without the ones it had.
     pub(super) fn replace_market(&mut self, item: &WatchlistInstrument) {
+        let from = self.drawing_market();
         self.symbol = item.instrument.symbol.clone();
         self.source = item.instrument.source;
         self.apply_watchlist_metadata(item);
         self.clear_market_data();
+        self.file_drawings(&from);
         if !self.source.takes_indicators() {
             self.indicators = IndicatorConfig::default();
             self.chart.set_pine_instances(Vec::new());
@@ -237,11 +256,13 @@ impl Chart {
     /// chart showed. The caller reloads the candles.
     pub(super) fn swap_market(&mut self, state: MarketState) -> MarketState {
         let current = self.market_state();
+        let from = self.drawing_market();
         self.symbol = state.symbol;
         self.source = state.source;
         self.chart.set_title(state.title);
         self.image_url = state.image_url;
         self.clear_market_data();
+        self.file_drawings(&from);
         self.pm_series = state.pm_series;
         current
     }
@@ -251,7 +272,7 @@ impl Chart {
         self.pm_series.clear();
         self.last_paper_quote = None;
         self.last_data_ms = None;
-        self.last_live_open_time = None;
+        self.forget_live();
         self.candles.clear();
         self.reset_history();
     }
@@ -282,13 +303,7 @@ impl Chart {
             chart.indicators = IndicatorConfig::default();
             chart.chart.set_pine_instances(Vec::new());
         }
-        chart.drawings = saved.drawings;
-        chart.next_drawing_id = chart
-            .drawings
-            .iter()
-            .map(Drawing::stored_id)
-            .max()
-            .map_or(1, |max| max + 1);
+        chart.set_stored_drawings(saved.drawings);
         chart
     }
 
@@ -299,7 +314,6 @@ impl Chart {
         let (sender, receiver) = mpsc::channel();
         let symbol = self.symbol.clone();
         let source = self.source;
-        let interval = timeframe.interval();
         let choices = self.pm_series.clone();
         let repaint = ctx.clone();
 
@@ -313,7 +327,7 @@ impl Chart {
                 return;
             }
             let result = if choices.is_empty() {
-                service::fetch_klines(source, &symbol, interval, CANDLE_LIMIT).map(|candles| {
+                service::fetch_klines(source, &symbol, timeframe, CANDLE_LIMIT).map(|candles| {
                     Fetched {
                         candles,
                         series: Vec::new(),
@@ -323,7 +337,7 @@ impl Chart {
                 Fetched::from_choices(service::fetch_choices(
                     source,
                     &choices,
-                    interval,
+                    timeframe,
                     CANDLE_LIMIT,
                 ))
             };
@@ -339,12 +353,35 @@ impl Chart {
     /// How long after a fetch began the next one is due.
     pub(super) fn refresh_after(&self) -> Duration {
         match self.source {
-            DataSource::CoinGecko | DataSource::DexScreener if self.error.is_some() => {
+            DataSource::CoinGecko | DataSource::DexScreener | DataSource::Kraken
+                if self.error.is_some() =>
+            {
                 SLOW_RETRY_INTERVAL
             }
-            DataSource::CoinGecko | DataSource::DexScreener => SLOW_REFRESH_INTERVAL,
+            DataSource::CoinGecko | DataSource::DexScreener | DataSource::Kraken => {
+                SLOW_REFRESH_INTERVAL
+            }
             _ => REFRESH_INTERVAL,
         }
+    }
+
+    /// Forgets what the live feed delivered: the candles are another market's or timeframe's.
+    pub(super) fn forget_live(&mut self) {
+        self.live = None;
+        self.live_fold.reset();
+    }
+
+    /// Whether the refresh loop should fetch again: a request is not out, the time is up, and the
+    /// last answer was not that the source has no such timeframe, which asking again cannot
+    /// change. The market and the timeframe are fetched when they change, whatever this says.
+    pub(super) fn refresh_due(&self) -> bool {
+        self.is_market()
+            && self.inbox.is_none()
+            && self.last_fetch.elapsed() >= self.refresh_after()
+            && !self
+                .error
+                .as_ref()
+                .is_some_and(ProviderError::is_unsupported_interval)
     }
 
     /// Forgets what was learnt of the history behind the candles: they are another market's or
@@ -373,14 +410,13 @@ impl Chart {
         }
         let (sender, receiver) = mpsc::channel();
         let (source, symbol) = (self.source, self.symbol.clone());
-        let interval = timeframe.interval();
         let repaint = ctx.clone();
         let asked = symbol.clone();
         service::work_queue::submit_for(source, move || {
             let page = service::fetch_klines_range(
                 source,
                 &asked,
-                interval,
+                timeframe,
                 0,
                 end,
                 market::history::PAGE,
@@ -441,8 +477,17 @@ impl Chart {
         self.inbox = None;
         match result {
             Ok(fetched) => {
-                let fresh =
-                    merge_fetched_candles(fetched.candles, &self.candles, self.last_live_open_time);
+                let live_open = self.live.and_then(|mark| mark.guard_for(self.last_fetch));
+                if live_open.is_none() {
+                    // The answer replaces the forming bucket: the socket's bars are of the past.
+                    self.live_fold.reset();
+                }
+                let fresh = market::live::merge_fetched(
+                    fetched.candles,
+                    &self.candles,
+                    live_open,
+                    CANDLE_LIMIT as usize,
+                );
                 self.candles =
                     market::history::with_older(&self.candles, fresh, self.older.keeps_older());
                 if !self.pm_series.is_empty() {
@@ -466,29 +511,6 @@ pub(super) struct OlderRequest {
     timeframe: Timeframe,
 }
 
-/// A websocket update for the current or a later bar wins over an older REST snapshot.
-pub(super) fn merge_fetched_candles(
-    mut fetched: Vec<Kline>,
-    current: &[Kline],
-    last_live_open_time: Option<i64>,
-) -> Vec<Kline> {
-    if let Some(live_open) = last_live_open_time
-        && let Some(last_fetched) = fetched.last()
-    {
-        let newer = current
-            .partition_point(|candle| candle.open_time < live_open.max(last_fetched.open_time));
-        if newer < current.len() {
-            let first_newer = current[newer].open_time;
-            fetched.retain(|candle| candle.open_time < first_newer);
-            fetched.extend_from_slice(&current[newer..]);
-        }
-    }
-    if fetched.len() > CANDLE_LIMIT as usize {
-        fetched.drain(..fetched.len() - CANDLE_LIMIT as usize);
-    }
-    fetched
-}
-
 pub(super) fn displayed_candles(candles: &[Kline], replay_ms: Option<i64>) -> &[Kline] {
     let Some(replay_ms) = replay_ms else {
         return candles;
@@ -502,14 +524,6 @@ mod tests {
     use super::*;
     use crate::workspace::test_support::candle;
 
-    #[test]
-    fn live_candle_wins_over_an_older_rest_snapshot() {
-        let fetched = vec![candle(1, 10.0), candle(2, 20.0)];
-        let live = vec![candle(1, 10.0), candle(2, 25.0), candle(3, 30.0)];
-        assert_eq!(merge_fetched_candles(fetched.clone(), &live, Some(2)), live);
-        assert_eq!(merge_fetched_candles(fetched.clone(), &live, None), fetched);
-    }
-
     /// A chart holding `times`, with a request for older candles outstanding that answers `page`.
     fn chart_awaiting_older(times: &[i64], page: Result<Vec<Kline>, ProviderError>) -> Chart {
         let mut chart = Chart::blank(1, "BTCUSDT", DataSource::Binance);
@@ -521,7 +535,7 @@ mod tests {
             receiver,
             source: DataSource::Binance,
             symbol: "BTCUSDT".into(),
-            timeframe: Timeframe::Hour,
+            timeframe: Timeframe::HOUR_1,
         });
         chart
     }
@@ -540,6 +554,45 @@ mod tests {
         assert_eq!(dex.refresh_after(), SLOW_RETRY_INTERVAL);
     }
 
+    #[test]
+    fn kraken_charts_refresh_slowly_because_the_socket_keeps_them_live() {
+        let mut kraken = Chart::blank(1, "BTC/USD", DataSource::Kraken);
+        assert_eq!(kraken.refresh_after(), SLOW_REFRESH_INTERVAL);
+        kraken.error = Some(ProviderError::Network(
+            crate::service::net::http::Error::Status(429),
+        ));
+        assert_eq!(kraken.refresh_after(), SLOW_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn a_source_with_no_such_timeframe_is_not_refreshed_until_something_changes() {
+        let mut chart = Chart::blank(1, "bitcoin", DataSource::CoinGecko);
+        chart.last_fetch = Instant::now() - SLOW_REFRESH_INTERVAL - Duration::from_secs(1);
+        assert!(chart.refresh_due());
+
+        let (sender, receiver) = mpsc::channel();
+        let unsupported = ProviderError::unsupported(DataSource::CoinGecko, Timeframe::MINUTE_1);
+        sender.send(Err(unsupported.clone())).unwrap();
+        chart.inbox = Some(receiver);
+        chart.receive_fetch();
+        // The chart says why, in the slot every error uses.
+        assert_eq!(chart.error, Some(unsupported));
+        assert_eq!(
+            chart.error.as_ref().map(ToString::to_string).as_deref(),
+            Some("CoinGecko has no 1m history")
+        );
+        chart.last_fetch = Instant::now() - Duration::from_secs(3_600);
+        assert!(
+            !chart.refresh_due(),
+            "asking again cannot change the answer"
+        );
+
+        // Any other failure is retried as before, and a fetch for another timeframe or market
+        // (which does not wait for this check) replaces the error with its own answer.
+        chart.error = Some(ProviderError::other("down"));
+        assert!(chart.refresh_due());
+    }
+
     fn open_times(chart: &Chart) -> Vec<i64> {
         chart.candles.iter().map(|bar| bar.open_time).collect()
     }
@@ -548,7 +601,7 @@ mod tests {
     fn an_older_page_goes_in_front_and_a_refresh_does_not_lose_it() {
         let mut chart =
             chart_awaiting_older(&[10, 11, 12], Ok(vec![candle(7, 1.0), candle(8, 1.0)]));
-        chart.receive_older(Timeframe::Hour);
+        chart.receive_older(Timeframe::HOUR_1);
         assert_eq!(open_times(&chart), vec![7, 8, 10, 11, 12]);
         assert!(chart.older_inbox.is_none());
 
@@ -581,10 +634,47 @@ mod tests {
         assert_eq!(open_times(&chart), vec![2, 3]);
     }
 
+    /// A chart holding live bar 2 (closing 9.0), refreshing since `begun` with a fetch that
+    /// answers bar 2 closing 2.0; the live bar arrived `live_after` after the fetch began.
+    fn refreshed_over_live_bar(live_after: Duration, quiet: bool) -> Chart {
+        let begun = Instant::now();
+        let mut chart = Chart::blank(1, "BTCUSDT", DataSource::Binance);
+        chart.candles = vec![candle(1, 1.0), candle(2, 9.0)];
+        chart.last_fetch = begun;
+        let arrived = if quiet {
+            begun - live_after
+        } else {
+            begun + live_after
+        };
+        chart.live = Some(LiveMark::new(2, arrived));
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(Fetched {
+                candles: vec![candle(1, 1.0), candle(2, 2.0)],
+                series: Vec::new(),
+            }))
+            .unwrap();
+        chart.inbox = Some(receiver);
+        chart.receive_fetch();
+        chart
+    }
+
+    #[test]
+    fn a_refresh_keeps_a_live_bar_that_arrived_while_it_was_out() {
+        let chart = refreshed_over_live_bar(Duration::from_millis(200), false);
+        assert_eq!(chart.candles[1].close, 9.0);
+    }
+
+    #[test]
+    fn a_refresh_updates_the_forming_bar_once_the_socket_went_quiet() {
+        let chart = refreshed_over_live_bar(Duration::from_secs(30), true);
+        assert_eq!(chart.candles[1].close, 2.0);
+    }
+
     #[test]
     fn an_older_page_for_a_timeframe_the_chart_left_is_dropped() {
         let mut chart = chart_awaiting_older(&[10, 11], Ok(vec![candle(7, 1.0)]));
-        chart.receive_older(Timeframe::Day);
+        chart.receive_older(Timeframe::DAY_1);
         assert_eq!(open_times(&chart), vec![10, 11]);
         assert!(chart.older_inbox.is_none());
     }
@@ -592,7 +682,7 @@ mod tests {
     #[test]
     fn a_failed_older_page_is_not_retried_at_once() {
         let mut chart = chart_awaiting_older(&[10, 11], Err(ProviderError::other("offline")));
-        chart.receive_older(Timeframe::Hour);
+        chart.receive_older(Timeframe::HOUR_1);
         assert_eq!(open_times(&chart), vec![10, 11]);
         assert!(
             !chart.older.should_request(true, true, 2, Instant::now()),
@@ -603,14 +693,14 @@ mod tests {
     #[test]
     fn an_empty_older_page_is_the_start_of_history() {
         let mut chart = chart_awaiting_older(&[10, 11], Ok(Vec::new()));
-        chart.receive_older(Timeframe::Hour);
+        chart.receive_older(Timeframe::HOUR_1);
         assert!(!chart.older.should_request(true, true, 2, Instant::now()));
     }
 
     #[test]
     fn changing_the_market_forgets_the_history_behind_the_old_one() {
         let mut chart = chart_awaiting_older(&[10, 11], Ok(Vec::new()));
-        chart.receive_older(Timeframe::Hour);
+        chart.receive_older(Timeframe::HOUR_1);
         chart.reset_history();
         assert!(chart.older.should_request(true, true, 2, Instant::now()));
     }
@@ -680,7 +770,7 @@ mod tests {
             y_zoom: 1.0,
             indicators: IndicatorConfig::default(),
             appearance: crate::model::ChartAppearance::default(),
-            drawings: Vec::new(),
+            drawings: Default::default(),
             pine_instances: Vec::new(),
             candle_count: 0,
             viewport: Default::default(),

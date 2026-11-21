@@ -13,6 +13,7 @@ use crate::app::session::PersistedSpecialTab;
 use crate::app::session::PersistedSpecialTabKind;
 use crate::app::session::PersistedTab;
 use crate::app::session::SessionState;
+use crate::app::session::next_tab_id;
 use crate::app::tabs::TabContent;
 use crate::app::tabs::TabSlot;
 use crate::app::tabs::TabState;
@@ -79,6 +80,8 @@ enum AppAction {
     OpenAiSettings,
     /// Open Settings on the Snapshots page.
     OpenSnapshotSettings,
+    /// Open Settings on the Pine Studio page, where the editor's themes are.
+    OpenEditorThemeSettings,
     OpenAlerts,
     /// The price-alert sheet in a chart window saved an alert.
     SavePriceAlert {
@@ -306,19 +309,30 @@ impl DegenViewApp {
             )
         };
 
+        // Rows a newer version wrote stay in the table untouched; see `UnknownTab`.
+        let (kept, saved_tabs): (Vec<_>, Vec<_>) = saved_tabs
+            .into_iter()
+            .partition(|tab| matches!(tab, PersistedTab::Unknown(_)));
+        let next_id = next_tab_id(saved_next_id, &kept);
+
         let (slots, next_id) = if saved_tabs.is_empty() {
+            let (first_id, next_id) = if kept.iter().any(|tab| tab.id() == 1) {
+                (next_id, next_id + 1)
+            } else {
+                (1, next_id)
+            };
             (
                 vec![TabSlot::new(TabContent::Chart(Box::new(
                     ChartWorkspace::empty(
-                        1,
-                        Timeframe::Day,
+                        first_id,
+                        Timeframe::DAY_1,
                         Arc::clone(&watchlist),
                         quote_book.clone(),
                         quote_coordinator.clone(),
                         store.clone(),
                     ),
                 )))],
-                2,
+                next_id,
             )
         } else {
             let mut has_portfolio = false;
@@ -353,12 +367,13 @@ impl DegenViewApp {
                         Some(TabSlot::new(TabContent::Pine(Box::new(PineStudio::new(
                             id,
                             store.clone(),
+                            editor_themes.clone(),
                         )))))
                     }
-                    PersistedTab::Special(_) => None,
+                    PersistedTab::Special(_) | PersistedTab::Unknown(_) => None,
                 })
                 .collect();
-            (tabs, saved_next_id.max(2))
+            (tabs, next_id)
         };
 
         let first_window = Placement::for_work_area(native_bridge::main_work_area().map(
@@ -390,7 +405,7 @@ impl DegenViewApp {
             script_signature: 0,
             notifier,
             actions,
-            session: SessionState::new(),
+            session: SessionState::new(kept),
             root_hidden: false,
         }
     }
@@ -426,6 +441,7 @@ impl eframe::App for DegenViewApp {
             self.broker_host.revision(),
         );
         self.tick_broker_notices();
+        self.tick_paper_sound();
         self.broker_host.tick_quotes();
         self.tabs.tick_links(ctx);
         self.tabs.windows().restore_frames(

@@ -27,6 +27,7 @@ use crate::ui::kit;
 use crate::ui::settings::mcp::McpSettingsInput;
 use crate::ui::settings::window;
 use crate::ui::shortcut;
+use crate::ui::theme;
 use crate::ui::window::tab_bar::{self, TabBar, TabView, WindowChoice};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -83,6 +84,7 @@ fn show_window(
     chart_info: Option<crate::pine_studio::ChartInfo>,
 ) {
     let ctx = ui.ctx().clone();
+    crate::crash_report::confirm_first_frame(&ctx);
     if ui.input(|input| input.viewport().close_requested()) {
         // The app closes the window's tabs (a script with edits asks first) and drops the
         // window itself; until then it stays up.
@@ -198,6 +200,7 @@ fn show_window(
     }
     if focused {
         show_restart_prompt(&ctx, env, &update);
+        show_session_save_error(&ctx, &env.session_save_error);
         env.mcp_questions.show(&ctx);
         let cycle = ui.input_mut(|input| {
             // macOS reaches these two through File ▸ New Tab / Close Tab.
@@ -241,15 +244,35 @@ fn show_window(
     ui.push_id(window.active, |ui| {
         show_tab(ui, env, window.active, &content, chart_info);
     });
+}
 
-    if let Some(message) = env.session_save_error.message() {
-        egui::Window::new("Could not save session")
-            .id(egui::Id::new(("session-save-error", window_id)))
-            .collapsible(false)
-            .show(&ctx, |ui| {
-                ui.label(message);
-                ui.label("The app will retry automatically.");
-            });
+/// Says the open tabs could not be saved, with the raw error to copy into a bug report. Only the
+/// focused window asks; any dismissal hides it until a different failure comes. Saving goes on.
+fn show_session_save_error(ctx: &egui::Context, error: &SessionSaveError) {
+    let Some(message) = error.visible_message() else {
+        return;
+    };
+    let spec = kit::Notice {
+        icon: Icon::Triangle,
+        tint: kit::ORANGE,
+        title: "Couldn\u{2019}t Save Open Tabs",
+        message: "DegenView couldn\u{2019}t save which tabs are open, so they may not reopen after a restart. It keeps trying in the background.",
+    };
+    let dismissed = kit::notice_with(ctx, egui::Id::new("session-save-error"), &spec, |ui| {
+        ui.add_space(10.0);
+        ui.add(
+            egui::Label::new(kit::text(
+                &message,
+                kit::size::CAPTION + 0.5,
+                kit::REGULAR,
+                theme::text_secondary(),
+            ))
+            .wrap()
+            .selectable(true),
+        );
+    });
+    if dismissed {
+        error.dismiss();
     }
 }
 
@@ -389,7 +412,7 @@ impl DegenViewApp {
             egui::ViewportBuilder::default()
                 .with_title("Settings")
                 .with_inner_size(window::WINDOW_SIZE)
-                .with_min_inner_size([520.0, 400.0]),
+                .with_min_inner_size(window::MIN_SIZE),
         );
         ctx.show_viewport_deferred(settings_viewport_id(), builder, move |ui, _class| {
             if ui.input(|input| input.viewport().close_requested()) {

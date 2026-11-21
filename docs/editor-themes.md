@@ -1,8 +1,8 @@
 # Editor themes
 
 What the Pine editor looks like: the colour of every kind of text and of the surfaces around it, and
-the font the code is set in. Settings ▸ Pine Studio chooses and edits them; every window's editor
-follows at once.
+the font the code is set in. Settings ▸ Pine Studio chooses and edits them, and the Pine Studio's
+**Theme** menu (in the strip over the editor) chooses one; every window's editor follows at once.
 
 **Status.** Built-in Dark, Light and Dracula; custom themes (create, duplicate, rename, delete,
 edit, import, export); typography (font family, size, line height) with **JetBrains Mono built in and
@@ -171,8 +171,8 @@ about 205 KB) and is the default editor font, on every platform, with nothing to
 build (no ligatures): egui shapes text with the font's default features and the editor draws each syntax
 colour as its own run, so ligatures would form in some runs and not in others. The file is unmodified, and
 under the SIL Open Font License 1.1 with no Reserved Font Name; the licence texts, the copyright notices,
-the version, where the file comes from and its hash are in `assets/fonts/README.md` and the root
-`README.md`, and the licence texts ship in every download (the macOS bundle's `Resources/Licenses`, the
+the version, where the file comes from and its hash are in `assets/fonts/README.md` and
+`docs/licensing.md`, and the licence texts ship in every download (the macOS bundle's `Resources/Licenses`, the
 Flatpak's `share/licenses`, the Linux and Windows archives). A test (`bundled_fonts_tests`) holds the file to
 its recorded hash and checks that the licences, the READMEs and the packaging say what they must.
 
@@ -276,6 +276,18 @@ typography value is checked on its own, and a bad one is skipped and reported (n
 equal to the base's are dropped, so the imported theme overrides only what differs. **An import never
 replaces a theme**: it gets a new id and the first free name (`Name 2`), and it is worn once imported.
 Where there are no file dialogs (Windows) Import is not offered and Export writes to the downloads folder.
+
+## The Theme menu
+
+The Pine Studio's menu strip has a Theme menu (`pine_studio/menu_bar/themes.rs`) with the same choices as
+Settings' tiles, in the same order and under the same names: Automatic, Dark, Light, Dracula, then (after a
+separator) your own themes, the one worn checked. Choosing a row calls `EditorThemeHost::select`, as a
+tile does, so it is one path: every window repaints and the choice is saved after the usual pause. The
+rows come from `EditorThemeHost::choices()`, which copies the worn theme and the custom names and none of
+the colours, and is read only while the menu is open. The list scrolls past 320 points and a long name is cut
+at the menu's widest (360). Under a separator, "Configure Themes…" opens Settings on the Pine Studio page
+(`PineStudioAction::OpenEditorThemeSettings`). The menu offers no create, rename or delete: those are on the page.
+Pictures: `gallery_of_the_menu_bar` (`pine_studio/tests.rs`).
 
 ## The page
 

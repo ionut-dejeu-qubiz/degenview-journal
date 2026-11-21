@@ -1,6 +1,6 @@
 [package]
 name = "degenview"
-version = "0.6.0-rc.27"
+version = "0.6.0-rc.31"
 edition = "2024"
 rust-version = "1.95"
 description = "A native macOS market dashboard, rewritten in Rust"
@@ -50,7 +50,8 @@ thiserror = "2.0.21"
 hmac = "0.12.1"
 rusqlite = { version = "0.41", features = ["bundled"] }
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-ureq = "3.4.2"
+# 3.5.1 percent-encodes proxy credentials; `Spec::build` relies on it (3.4.x mangles `@`, `:`, `/`).
+ureq = { version = "3.5.1", features = ["socks-proxy"] }
 rmcp = { version = "3.5.1", features = ["transport-streamable-http-server"] }
 tokio = { version = "1.53.2", features = ["rt", "net", "sync", "macros", "time"] }
 axum = "0.8.9"
@@ -78,24 +79,25 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 # account in sync, in their own repository (degenview/brokers) and published to crates.io. Pinned to
 # one exact version; no UI, database or async runtime lives in it. DegenView supplies the secret
 # store, the pending-order journal and everything on screen. docs/broker-trading.md.
-degenview-brokers = { version = "=0.3.1", features = ["coinbase"] }
+degenview-brokers = { version = "=0.4.0", features = ["coinbase"] }
 
 # Secret storage on Linux (docs/flatpak.md): the Secret Service, or the Secret portal in a Flatpak.
 [target.'cfg(target_os = "linux")'.dependencies]
 oo7 = "0.6"
 # The XDG file chooser portal, which a Flatpak has no other way to reach a file through. No GTK:
 # `rfd` talks to the portal itself and loads libdbus when a dialog opens.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 # Asks the X server whether a compositor is running, which decides whether windows round their
 # corners (`ui::window_chrome::rounded_corners`). Already in the tree through winit; the core
 # protocol only.
 x11rb = { version = "0.14", default-features = false }
 
+# `Win32_Media_Audio`: `PlaySoundW` for `service::sound`.
 # Secret storage on Windows: Credential Manager (`service::keychain::windows_credentials`) and DPAPI for the MCP
 # TLS key file (`mcp::transport::tls_protect`). Already in the tree (eframe, mio, tokio); generated bindings,
 # no dependencies of its own.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_System_Registry"] }
 windows = { version = "=0.62.2", default-features = false, features = ["Data_Xml_Dom", "UI_Notifications", "Win32_System_WinRT"] }
 
 [target.'cfg(windows)'.build-dependencies]
@@ -118,6 +120,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSPasteboard",
     "NSResponder",
     "NSScreen",
+    "NSSound",
     "NSView",
     "NSWindow",
 ] }
@@ -167,4 +170,4 @@ strip = true
 
 [dev-dependencies]
 # The crate's loopback mock exchange, for tests of the live-trading host.
-degenview-brokers = { version = "=0.3.1", features = ["testing"] }
+degenview-brokers = { version = "=0.4.0", features = ["testing"] }

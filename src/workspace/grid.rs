@@ -252,7 +252,11 @@ impl ChartWorkspace {
         let mut crosshair_update: Option<CrosshairInfo> = None;
         let mut hover_update: Option<(u64, crate::model::Anchor)> = None;
         self.tools.give_pointer_to_tool();
+        self.give_pointer_to_tool_over_selection();
+        let selecting_portion = self.is_selecting_portion();
         let (active_tool, zoom_armed) = (self.tools.active_tool(), self.tools.is_zoom_armed());
+        let cursor = self.tools.cursor();
+        let values_tooltip = self.tools.values_tooltip();
         let selected_drawing = self.tools.selection().cloned();
         let (magnet, keep_drawing, hide_all_drawings) = (
             self.tools.magnet(),
@@ -307,13 +311,15 @@ impl ChartWorkspace {
         let mut drawing_properties_request: Option<(u64, u64)> = None;
         let mut drawing_style_copied: Option<(Tool, DrawingStyle)> = None;
         let style_clipboard = self.tools.style_clipboard();
-        let dialog_open = self.tools.has_dialog() || self.content.sheet_open();
+        let dialog_open =
+            self.tools.has_dialog() || self.content.sheet_open() || self.studio_open();
         let mut drawing_reveal = false;
         let mut drawing_copy = false;
         let mut drawing_alert: Option<(u64, f64)> = None;
         let drawing_defaults = self.drawing_templates().defaults().clone();
         let drawing_preview: Option<(u64, Drawing)> = self.tools.previewed_draft();
         let mut drawing_escape = false;
+        self.reserve_escape_for_favorites_menu(ui.ctx());
         let mut paper_actions = Vec::new();
         let mut quick_trade = None;
         let mut live_actions = Vec::new();
@@ -538,6 +544,7 @@ impl ChartWorkspace {
                                             )
                                             .with_style_clipboard(style_clipboard)
                                             .with_keys_blocked(dialog_open)
+                                            .with_cursor(cursor)
                                             .with_defaults(&drawing_defaults)
                                             .with_preview(
                                                 drawing_preview
@@ -548,6 +555,9 @@ impl ChartWorkspace {
                                                     .map(|(_, draft)| draft),
                                             );
                                             chart.chart.set_zoom_armed(zoom_armed);
+                                            chart.chart.set_cursor_mode(cursor);
+                                            chart.chart.set_values_tooltip(values_tooltip);
+                                            chart.chart.set_snapshot_select(selecting_portion);
                                             let for_logs = logs_chart == Some(chart_id);
                                             chart
                                                 .chart
@@ -560,8 +570,11 @@ impl ChartWorkspace {
                                                 },
                                             );
                                             let mut replay_frame = ReplayChartFrame {
-                                                selecting: replay_selecting
-                                                    || (for_logs && logs_picking),
+                                                // Select portion has the pointer: nothing is
+                                                // picked meanwhile, and the pick waits.
+                                                selecting: (replay_selecting
+                                                    || (for_logs && logs_picking))
+                                                    && !selecting_portion,
                                                 active: replay_active,
                                                 picked_ms: None,
                                                 picked_range: None,
@@ -685,6 +698,7 @@ impl ChartWorkspace {
                                                     frozen: false,
                                                     owner_id: chart_id,
                                                     x_fraction,
+                                                    time: pointer.hover_time,
                                                     price,
                                                 });
                                             }
@@ -748,6 +762,8 @@ impl ChartWorkspace {
             previewed,
             &mut commands,
         );
+        drawing_escape |= self.drive_portion_selection(&ctx, grid_rect);
+        self.show_favorites_bar(&ctx, grid_rect);
 
         if !favorite_toggles.is_empty() || !watchlist_changes.is_empty() {
             let mut store = lock(&self.watchlist);
@@ -957,6 +973,7 @@ impl ChartWorkspace {
             && !drawing_escape
             && !self.replay.is_choosing_date()
             && !self.context_menu_open()
+            && !self.studio_open()
         {
             if self.replay.is_selecting_start() {
                 self.replay.cancel_selection();
@@ -1010,6 +1027,7 @@ mod freeze_tests {
             frozen: false,
             owner_id,
             x_fraction: 0.25,
+            time: Some(1_700_000_000_000.0),
             price: 12.5,
         }
     }
@@ -1018,7 +1036,10 @@ mod freeze_tests {
     fn a_frozen_crosshair_stays_where_it_was_and_only_for_its_own_chart() {
         let frozen = freeze(Some(crosshair(3)), 3).expect("kept");
         assert!(frozen.frozen);
-        assert_eq!((frozen.x_fraction, frozen.price), (0.25, 12.5));
+        assert_eq!(
+            (frozen.x_fraction, frozen.time, frozen.price),
+            (0.25, Some(1_700_000_000_000.0), 12.5)
+        );
         assert!(
             freeze(Some(crosshair(3)), 4).is_none(),
             "another chart's is dropped"

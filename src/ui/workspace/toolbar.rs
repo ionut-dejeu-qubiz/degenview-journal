@@ -1,5 +1,5 @@
 //! The chart window's toolbar, on the shared flat bar (`ui::kit::bar`). Left to right: the symbol
-//! of the focused chart, the chart type, Indicators, the timeframe, Replay and Alert (the last two
+//! of the focused chart, the timeframe, Indicators, the chart type, Replay and Alert (the last two
 //! icon only), Undo and Redo, in groups divided by separators. On the right: the layout menu,
 //! chart settings, the snapshot menu, Portfolio, Pine Studio and the watchlist toggle. The replay
 //! bar under it (`replay_bar.rs`) uses the same flat style. The symbol, chart type, Indicators and
@@ -9,7 +9,8 @@ use crate::model::{ChartType, DataSource, Timeframe};
 use crate::ui::chart::type_menu;
 use crate::ui::icons::{self, Icon};
 use crate::ui::kit::bar::{self, Glyph};
-use crate::ui::kit::{self, BOLD, MEDIUM, REGULAR, SEMIBOLD, size};
+use crate::ui::kit::timeframe_picker::{self, TimeframePick};
+use crate::ui::kit::{self, BOLD, REGULAR, SEMIBOLD, size};
 use crate::ui::shortcut;
 use crate::ui::theme;
 use eframe::egui::{self, Color32, Id, Rect, Response, Sense, Ui, Vec2, pos2, vec2};
@@ -17,6 +18,11 @@ use std::sync::Arc;
 
 pub struct ToolbarInput<'a> {
     pub timeframe: Timeframe,
+    /// The custom timeframes pinned in the timeframe picker.
+    pub pinned: &'a [Timeframe],
+    /// The market sources of the tab's charts: the picker warns of one that cannot draw a
+    /// timeframe.
+    pub sources: &'a [DataSource],
     pub layout_name: &'a str,
     pub unsaved: bool,
     pub autosave: AutosaveState,
@@ -67,6 +73,9 @@ pub struct AutosaveState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolbarAction {
     SetTimeframe(Timeframe),
+    /// Chart this timeframe and keep it among the picker's chips.
+    PinTimeframe(Timeframe),
+    UnpinTimeframe(Timeframe),
     /// Open the symbol picker, to change the focused chart's market.
     OpenSymbolSearch,
     /// Open the symbol picker to compare another market on the focused chart.
@@ -91,6 +100,8 @@ pub enum ToolbarAction {
     CreateAlert,
     /// Take this snapshot of the focused chart.
     Snapshot(crate::model::chart::snapshot::SnapshotAction),
+    /// Start choosing which part of the charts to capture.
+    SelectPortion,
     /// Open the Snapshots page of Settings.
     SnapshotSettings,
     Undo,
@@ -112,11 +123,12 @@ pub fn replay_tooltip(replay_open: bool, has_market: bool) -> &'static str {
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     ChartType,
+    Timeframe,
     Layout,
     Snapshot,
 }
 
-/// The popup of a button that owns one: the chart type, the layout and the camera menus.
+/// The popup of a button that owns one: the chart type, timeframe, layout and camera menus.
 type Item = bar::Item<ToolbarAction, Menu>;
 type Button = bar::Button<ToolbarAction, Menu>;
 
@@ -134,11 +146,33 @@ pub fn show(ui: &mut Ui, input: &ToolbarInput) -> Vec<ToolbarAction> {
                     actions.push(ToolbarAction::SetChartType(picked));
                 }
             }
+            Menu::Timeframe => {
+                let picker = timeframe_picker::TimeframePickerInput {
+                    current: input.timeframe,
+                    pinned: input.pinned,
+                    sources: input.sources,
+                };
+                match timeframe_picker::show(ui, response, &picker) {
+                    Some(TimeframePick::Chart(timeframe)) => {
+                        actions.push(ToolbarAction::SetTimeframe(timeframe));
+                    }
+                    Some(TimeframePick::ChartAndPin(timeframe)) => {
+                        actions.push(ToolbarAction::PinTimeframe(timeframe));
+                    }
+                    Some(TimeframePick::Unpin(timeframe)) => {
+                        actions.push(ToolbarAction::UnpinTimeframe(timeframe));
+                    }
+                    None => {}
+                }
+            }
             Menu::Layout => layout_popup(ui, response, input, actions),
             Menu::Snapshot => {
                 match crate::ui::workspace::snapshot_menu::menu(ui, response, &input.snapshot) {
                     Some(crate::ui::workspace::snapshot_menu::Pick::Take(picked)) => {
                         actions.push(ToolbarAction::Snapshot(picked));
+                    }
+                    Some(crate::ui::workspace::snapshot_menu::Pick::SelectPortion) => {
+                        actions.push(ToolbarAction::SelectPortion);
                     }
                     Some(crate::ui::workspace::snapshot_menu::Pick::Configure) => {
                         actions.push(ToolbarAction::SnapshotSettings);
@@ -176,16 +210,18 @@ fn left_items(input: &ToolbarInput) -> Vec<Item> {
             .on_click(ToolbarAction::CompareSymbol),
     ));
     items.push(Item::Separator);
-    let chart_type = input
-        .chart
-        .map_or(ChartType::Candles, |chart| chart.chart_type);
-    let mut type_button = Button::new("chart-type", format!("Chart type: {}", chart_type.label()))
-        .enabled(input.chart.is_some_and(|chart| chart.chart_types));
-    type_button.glyph = Some(Glyph::Custom(Arc::new(move |painter, rect, color| {
-        type_menu::glyph(painter, rect, chart_type, color);
-    })));
-    type_button.menu = Some(Menu::ChartType);
-    items.push(Item::Button(type_button));
+    // One button for the tab's timeframe; its popover lists the presets and the pinned ones.
+    let mut timeframe = Button::new("timeframe", "Timeframe")
+        .label(input.timeframe.label())
+        .chevron()
+        .with_menu(Menu::Timeframe);
+    timeframe.keep_label = true;
+    timeframe.weight = SEMIBOLD;
+    timeframe.access = Some(format!(
+        "Timeframe: {}. Choose another",
+        input.timeframe.description()
+    ));
+    items.push(Item::Button(timeframe));
     items.push(Item::Separator);
     let indicators_tip = if input.chart.is_some_and(|chart| !chart.indicators) {
         "Indicators: this chart takes none"
@@ -200,19 +236,16 @@ fn left_items(input: &ToolbarInput) -> Vec<Item> {
             .on_click(ToolbarAction::OpenIndicators),
     ));
     items.push(Item::Separator);
-    for timeframe in Timeframe::ALL {
-        let selected = timeframe == input.timeframe;
-        let mut button = Button::new(("timeframe", timeframe.label()), timeframe.description());
-        button.label = Some(timeframe.label().to_owned());
-        button.quiet = !selected;
-        button.active = selected;
-        button.weight = if selected { SEMIBOLD } else { MEDIUM };
-        button.min_width = 34.0;
-        if !selected {
-            button.action = Some(ToolbarAction::SetTimeframe(timeframe));
-        }
-        items.push(Item::Button(button));
-    }
+    let chart_type = input
+        .chart
+        .map_or(ChartType::Candles, |chart| chart.chart_type);
+    let mut type_button = Button::new("chart-type", format!("Chart type: {}", chart_type.label()))
+        .enabled(input.chart.is_some_and(|chart| chart.chart_types));
+    type_button.glyph = Some(Glyph::Custom(Arc::new(move |painter, rect, color| {
+        type_menu::glyph(painter, rect, chart_type, color);
+    })));
+    type_button.menu = Some(Menu::ChartType);
+    items.push(Item::Button(type_button));
     items.push(Item::Separator);
 
     let mut replay = Button::new(
@@ -539,7 +572,9 @@ mod tests {
 
     fn input<'a>(layouts: &'a [(u64, String)], focused: bool) -> ToolbarInput<'a> {
         ToolbarInput {
-            timeframe: Timeframe::Day,
+            timeframe: Timeframe::DAY_1,
+            pinned: &[],
+            sources: &[DataSource::Binance],
             layout_name: "Morning",
             unsaved: false,
             autosave: AutosaveState::default(),
@@ -719,6 +754,167 @@ mod tests {
         asked
     }
 
+    /// The middle of the timeframe button as the bar lays it out at `width`.
+    fn timeframe_button(input: &ToolbarInput, width: f32) -> (egui::Pos2, f32) {
+        let ctx = egui::Context::default();
+        let mut found = None;
+        run(&ctx, screen(width), |ui| {
+            let (_, placed) = bar::geometry(ui, &left_items(input), &right_items(input), width);
+            found = placed
+                .into_iter()
+                .find(|button| button.menu == Some(Menu::Timeframe))
+                .map(|button| {
+                    (
+                        pos2((button.from + button.to) / 2.0, HEIGHT / 2.0),
+                        button.to - button.from,
+                    )
+                });
+        });
+        found.expect("the timeframe button is on the bar")
+    }
+
+    #[test]
+    fn one_button_names_the_timeframe_at_every_width() {
+        let layouts = Vec::new();
+        let mut input = input(&layouts, true);
+        input.timeframe = Timeframe::HOUR_4;
+        let labelled = left_items(&input)
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Button(button) if button.menu == Some(Menu::Timeframe) => Some(button),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labelled.len(), 1, "one button, not a row of them");
+        assert_eq!(labelled[0].label.as_deref(), Some("4h"));
+        assert!(labelled[0].chevron && labelled[0].keep_label);
+        // It keeps its text when the other labels go, so it is as wide as text and chevron.
+        let (_, wide) = timeframe_button(&input, 1600.0);
+        for width in [1100.0, 960.0, 760.0] {
+            let (_, narrow) = timeframe_button(&input, width);
+            assert_eq!(narrow, wide, "at {width}");
+        }
+    }
+
+    /// One frame of the bar with `events`, run on `ctx` at `time`.
+    fn frame_with(
+        ctx: &egui::Context,
+        input: &ToolbarInput,
+        width: f32,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<ToolbarAction> {
+        let mut asked = Vec::new();
+        let mut raw = screen(width);
+        raw.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 400.0)));
+        raw.time = Some(time);
+        raw.events = events;
+        run(ctx, raw, |ui| {
+            let bar = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, HEIGHT));
+            let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+            asked.extend(show(&mut bar_ui, input));
+        });
+        asked
+    }
+
+    /// Opens the timeframe picker with a click, lets it settle, then sends `events` and returns
+    /// what the bar asked for in the frames that followed.
+    fn through_the_picker(
+        input: &ToolbarInput,
+        typed: &str,
+        key: egui::Modifiers,
+    ) -> Vec<ToolbarAction> {
+        let width = 1400.0;
+        let (at, _) = timeframe_button(input, width);
+        let ctx = egui::Context::default();
+        let click = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut time = 0.0;
+        let mut asked = Vec::new();
+        let script = [
+            vec![egui::Event::PointerMoved(at)],
+            vec![click(true)],
+            vec![click(false)],
+            vec![],
+            vec![],
+            vec![],
+            vec![egui::Event::Text(typed.to_owned())],
+            vec![],
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: key,
+            }],
+            vec![],
+        ];
+        for events in script {
+            time += 0.1;
+            asked.extend(frame_with(&ctx, input, width, time, events));
+        }
+        asked
+    }
+
+    #[test]
+    fn a_timeframe_typed_in_the_picker_asks_to_chart_it() {
+        let layouts = Vec::new();
+        let input = input(&layouts, true);
+        let custom = Timeframe::new(22, crate::model::TimeUnit::Minute).unwrap();
+        assert_eq!(
+            through_the_picker(&input, "22m", egui::Modifiers::NONE),
+            vec![ToolbarAction::SetTimeframe(custom)]
+        );
+    }
+
+    #[test]
+    fn shift_return_in_the_picker_asks_to_chart_and_pin_it() {
+        let layouts = Vec::new();
+        let input = input(&layouts, true);
+        let custom = Timeframe::new(3, crate::model::TimeUnit::Hour).unwrap();
+        assert_eq!(
+            through_the_picker(&input, "3h", egui::Modifiers::SHIFT),
+            vec![ToolbarAction::PinTimeframe(custom)]
+        );
+    }
+
+    #[test]
+    fn the_timeframe_button_asks_for_nothing_by_itself() {
+        let layouts = Vec::new();
+        let input = input(&layouts, true);
+        for width in [1400.0, 960.0] {
+            let (at, _) = timeframe_button(&input, width);
+            let ctx = egui::Context::default();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let mut asked = Vec::new();
+            for (step, events) in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+                vec![],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                asked.extend(frame_with(&ctx, &input, width, step as f64 * 0.1, events));
+            }
+            assert!(asked.is_empty(), "opening the picker picks nothing");
+            assert!(
+                egui::Popup::is_any_open(&ctx),
+                "the click opened it at {width}"
+            );
+        }
+    }
+
     #[test]
     fn indicators_are_off_on_a_chart_that_takes_none() {
         let layouts = Vec::new();
@@ -744,7 +940,6 @@ mod tests {
             ToolbarAction::CompareSymbol,
             ToolbarAction::OpenIndicators,
             ToolbarAction::OpenChartSettings,
-            ToolbarAction::SetTimeframe(Timeframe::Week),
         ] {
             for width in [1400.0, 960.0] {
                 assert_eq!(click_on(&input, width, target), vec![target], "{target:?}");
@@ -808,7 +1003,7 @@ mod tests {
             pos2((from + to) / 2.0, HEIGHT / 2.0)
         };
         type Tweak = fn(&mut ToolbarInput);
-        let cases: [(&str, f32, Tweak, Option<ToolbarAction>); 7] = [
+        let cases: [(&str, f32, Tweak, Option<ToolbarAction>); 8] = [
             ("toolbar-wide", 1400.0, |_| {}, None),
             (
                 "toolbar-hover",
@@ -838,6 +1033,7 @@ mod tests {
                 None,
             ),
             ("toolbar-tiny", 900.0, |input| input.unsaved = true, None),
+            ("toolbar-narrowest", 960.0, |_| {}, None),
             (
                 "toolbar-snapshot-busy",
                 1400.0,
@@ -872,7 +1068,7 @@ mod tests {
         let at = centre_of(&input, width, ToolbarAction::OpenIndicators);
         let _ = at;
         let (_, buttons) = layout_at(&input, width);
-        // The left run is symbol | chart type | Indicators | timeframes | Replay, Alert | undo, redo; a
+        // The left run is symbol | timeframe | Indicators | chart type | Replay, Alert | undo, redo; a
         // separator is the only gap wider than a button gap.
         let left_run: Vec<_> = buttons.iter().filter(|button| button.0 < 700.0).collect();
         let starts: Vec<usize> = std::iter::once(0)
@@ -884,7 +1080,7 @@ mod tests {
                     .map(|(at, _)| at + 1),
             )
             .collect();
-        let type_button = *left_run[starts[1]];
+        let type_button = *left_run[starts[3]];
         assert!(
             type_button.2.is_none(),
             "the chart-type button opens a menu"
@@ -913,5 +1109,91 @@ mod tests {
             }));
         }
         screen.save("toolbar-chart-type-menu", last.expect("a frame"));
+    }
+
+    /// Pictures of the timeframe picker in both themes: the button closed, the popover open on
+    /// the current timeframe, with a typed one, with text that is none, with a pinned chip and
+    /// with the warning for a chart whose source cannot draw the highlighted timeframe.
+    #[test]
+    #[ignore = "writes images for a person to look at"]
+    fn gallery_of_the_timeframe_picker() {
+        use crate::model::TimeUnit;
+        use crate::ui::render_tests::{Screen, gallery_dir};
+        if gallery_dir().is_none() {
+            return;
+        }
+        let _theme = theme::RestoreDefaultTheme;
+        let layouts = vec![(1, "Morning".to_owned())];
+        let pinned = [Timeframe::new(22, TimeUnit::Minute).unwrap()];
+        let width = 700.0;
+        // (name, pinned, sources, text typed into the field; `None` leaves the popover closed)
+        type Case<'a> = (&'a str, &'a [Timeframe], &'a [DataSource], Option<&'a str>);
+        let cases: [Case; 6] = [
+            ("closed", &[], &[DataSource::Binance], None),
+            ("open", &[], &[DataSource::Binance], Some("")),
+            ("typed", &[], &[DataSource::Binance], Some("22m")),
+            ("error", &[], &[DataSource::Binance], Some("30s")),
+            ("pinned", &pinned, &[DataSource::Binance], Some("")),
+            (
+                "warning",
+                &pinned,
+                &[DataSource::Binance, DataSource::CoinGecko],
+                Some("1m"),
+            ),
+        ];
+        for (theme_name, app_theme) in [
+            ("dark", theme::AppTheme::Dark),
+            ("light", theme::AppTheme::Light),
+        ] {
+            for (name, pinned, sources, typed) in cases {
+                let mut input = input(&layouts, true);
+                input.timeframe = Timeframe::HOUR_1;
+                input.pinned = pinned;
+                input.sources = sources;
+                let height = if typed.is_some() { 520.0 } else { HEIGHT };
+                let mut screen = Screen::new(vec2(width, height));
+                theme::apply(&screen.ctx, app_theme);
+                let (at, _) = timeframe_button(&input, width);
+                let click = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                let mut script = vec![vec![]];
+                if let Some(text) = typed {
+                    script.extend([
+                        vec![egui::Event::PointerMoved(at)],
+                        vec![click(true)],
+                        vec![click(false)],
+                        vec![],
+                        vec![],
+                        vec![],
+                    ]);
+                    if !text.is_empty() {
+                        script.push(vec![egui::Event::Text(text.to_owned())]);
+                    }
+                    // The pointer rests away from the popover, so no chip looks hovered.
+                    script.extend([
+                        vec![egui::Event::PointerMoved(pos2(width - 5.0, 5.0))],
+                        vec![],
+                    ]);
+                } else {
+                    script.extend([vec![], vec![]]);
+                }
+                let mut last = None;
+                for events in script {
+                    last = Some(screen.run(events, |ui| {
+                        let bar = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, HEIGHT));
+                        let mut bar_ui = ui.new_child(egui::UiBuilder::new().max_rect(bar));
+                        show(&mut bar_ui, &input);
+                    }));
+                }
+                screen.save(
+                    &format!("timeframe-picker-{name}-{theme_name}"),
+                    last.expect("a frame"),
+                );
+            }
+        }
     }
 }

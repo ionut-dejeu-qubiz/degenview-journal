@@ -4,6 +4,7 @@
 
 use super::frame::FrameLayout;
 use super::*;
+use crate::model::chart::sync::TimeAxis;
 use crate::ui::paper::chart_trading::{MarkerMenu, PaperOverlayAction};
 
 /// What one call to [`ChartCard::body`] draws and reports on.
@@ -100,32 +101,42 @@ impl ChartCard {
         false
     }
 
-    /// Overlay scripts may draw past the last bar (a stack to the right of the chart) and above
-    /// or below the candles; the line chart draws none of that.
+    /// How far the overlay scripts in `outputs` reach for `viewport` over `bars` bars: overlay
+    /// scripts may draw past the last bar (a stack to the right of the chart) and above or below
+    /// the candles; the line chart draws none of that.
+    pub(super) fn extent_of(
+        &self,
+        viewport: &ChartViewport,
+        outputs: &[frame::Placed],
+        line: bool,
+        bars: usize,
+    ) -> OverlayExtent {
+        if line {
+            return OverlayExtent::default();
+        }
+        let shown_count = chart::canvas::visible_window(
+            bars,
+            viewport.horizontal.visible,
+            viewport.horizontal.right_offset,
+            usize::from(self.appearance.canvas.margins.right),
+        )
+        .count();
+        overlay_extent(
+            outputs
+                .iter()
+                .filter(|(output, _, _)| output.overlay)
+                .map(|(output, _, _)| &**output),
+            shown_count,
+        )
+    }
+
     pub(super) fn refresh_script_extent(
         &mut self,
         outputs: &[frame::Placed],
         line: bool,
         bars: usize,
     ) {
-        let shown_count = chart::canvas::visible_window(
-            bars,
-            self.viewport.horizontal.visible,
-            self.viewport.horizontal.right_offset,
-            usize::from(self.appearance.canvas.margins.right),
-        )
-        .count();
-        self.script_extent = if line {
-            OverlayExtent::default()
-        } else {
-            overlay_extent(
-                outputs
-                    .iter()
-                    .filter(|(output, _, _)| output.overlay)
-                    .map(|(output, _, _)| &**output),
-                shown_count,
-            )
-        };
+        self.script_extent = self.extent_of(&self.viewport, outputs, line, bars);
     }
 
     /// The panes the layout drew are the card's panes; a maximized one that is gone is dropped.
@@ -154,6 +165,7 @@ impl ChartCard {
         replay.picked_ms = None;
         replay.picked_range = None;
         let view = self.view(
+            self.framing(),
             bars,
             (plot, layout.top_inset),
             data.scale_mode,
@@ -164,12 +176,19 @@ impl ChartCard {
             main: layout.rect,
             chart: layout.full_rect,
         };
-        // The Zoom In tool owns the plot's pointer while it is armed: nothing is drawn or picked.
+        // A long touch is egui's right-click. Only a press the values tooltip has taken (the
+        // layer runs before `handle_hold`, so on the release frame it still has) swallows it: a
+        // press on a drawing, off the plot, with the option off or under a cursor that uses the
+        // press itself keeps its menu.
+        drawing.long_press_values = self.values_hold_claims_drag();
+        // The Zoom In tool and Select portion own the pointer while they are on: nothing is drawn
+        // or picked.
+        let held = self.pointer_is_held(layout.main_visible, replay.selecting);
         let zooming = self.zoom_is_live(layout.main_visible, replay.selecting);
         if layout.main_visible
             && let Some(view) = &view
         {
-            if replay.selecting || zooming {
+            if replay.selecting || held {
                 self.layer.clear_hover();
             } else {
                 self.layer.update(
@@ -182,20 +201,48 @@ impl ChartCard {
         }
         drawing.escape_consumed |=
             self.handle_zoom(ui, response, view.as_ref(), &regions, bars.len(), zooming);
+        // A range being picked (replay start, Pine Logs) has the drag to itself: no stroke over the
+        // bars it selects, and one begun before the pick started is let go.
+        let marks_allowed = layout.main_visible && !held && !replay.selecting;
+        if !marks_allowed {
+            let now = ui.input(|input| input.time);
+            self.demo.end(now);
+        }
+        if marks_allowed && let Some(view) = &view {
+            self.handle_demonstration(
+                ui,
+                response,
+                &view.projection(plot, bars, self.appearance.price_format(), ui.ctx()),
+                plot,
+            );
+        }
+        // Not while a drawing tool is armed: its press places anchors and drags out shapes, which
+        // the drawing layer (run above, before this) has already begun by the time a hold shows.
+        if layout.main_visible && !held && drawing.tool == crate::model::Tool::Cursor {
+            let blocked =
+                replay.selecting || self.layer.claims_drag() || self.demonstration_claims_drag();
+            self.handle_hold(ui, response, plot, blocked);
+        } else {
+            self.hold = Default::default();
+        }
         let navigation = navigation::Navigation {
             regions,
             shown: view
                 .as_ref()
                 .map(|view| PriceRange::new(view.scale.minimum, view.scale.maximum)),
             total: bars.len(),
-            slot_width: self.slot_width(plot),
+            slot_width: self.slot_width(self.framing(), plot),
+            reserved: self.reserved_slots_with(self.framing().extent),
             scale_height: view
                 .as_ref()
                 .map_or_else(|| plot.height(), |view| view.scale.height),
             logarithmic: view.as_ref().is_some_and(|view| view.scale.logarithmic),
             // Dragging over bars for the logs pane is not a pan.
             drawing_claims: self.layer.claims_drag()
+                || self.demonstration_claims_drag()
+                || self.values_hold_claims_drag()
                 || self.zoom_claims_drag()
+                || self.snapshot_select
                 || (replay.selecting && self.pick_kind == overlay::PickKind::LogsRange),
             response,
         };
@@ -242,16 +289,23 @@ impl ChartCard {
     }
 }
 
-/// Where the pointer is on the plot, for the workspace's crosshair and the other charts'.
+/// Where the pointer is on the plot, for the workspace's crosshair and the other charts'. `time`
+/// is the chart's time scale, given only when its slots are time (see
+/// [`ChartCard::takes_part_in_sync`]): the other charts find the pointer's column by it.
 pub(super) fn report_hover(
     pointer: &mut ChartPointer,
     response: &Response,
     plot: Rect,
     view: &View,
     projection: &Projection,
+    time: Option<TimeAxis>,
 ) {
     if let Some(position) = response.hover_pos().filter(|point| plot.contains(*point)) {
         pointer.hover_x_fraction = Some(((position.x - plot.left()) / plot.width()) as f64);
+        pointer.hover_time = time.and_then(|axis| {
+            let slots = view.geometry(plot, axis.len()).slots();
+            axis.time_at(slots.at(position.x))
+        });
         pointer.hover_price = Some(view.scale.price(position.y));
         pointer.hover_anchor = Some(projection.anchor(position));
     }
@@ -336,7 +390,8 @@ impl ChartCard {
         );
         let rect = response.rect;
         pointer.rect = Some(rect);
-        self.body_size = rect.size();
+        self.body_rect = rect;
+        self.axis_width = 0.0;
         let style = CanvasStyle::resolve(&self.appearance.canvas);
         let full_rect = rect;
         canvas::paint_background(&painter, rect, style.fill);
@@ -395,14 +450,28 @@ impl ChartCard {
             outputs: &outputs,
             indicators,
         };
-        let layout = self.frame_layout(&data, full_rect, self.top_inset, &painter, &style);
+        let layout = self.frame_layout(
+            &data,
+            self.framing(),
+            full_rect,
+            self.top_inset,
+            &painter,
+            &style,
+        );
         self.keep_panes_in_step(&layout);
         let plot = layout.plot;
+        self.axis_width = full_rect.max.x - plot.max.x;
         let pane_rects = &layout.pane_rects;
         let chart_hovered = ui.rect_contains_pointer(full_rect);
         let regions = self.handle_frame_input(ui, &response, &data, &layout, drawing, replay);
 
-        let Some(view) = self.view(bars, (plot, layout.top_inset), scale_mode, chart_type) else {
+        let Some(view) = self.view(
+            self.framing(),
+            bars,
+            (plot, layout.top_inset),
+            scale_mode,
+            chart_type,
+        ) else {
             return pointer;
         };
         self.near_oldest = view.start <= self.viewport.horizontal.visible * NEAR_OLDEST_SCREENS;
@@ -478,6 +547,10 @@ impl ChartCard {
         pointer.overlay_action = overlay_action;
         pointer.on_overlay_card = on_overlay_card;
         self.layer = layer;
+        if layout.main_visible && self.cursor.caps().highlights {
+            let now = ui.input(|input| input.time);
+            self.paint_demonstration(&painter, plot, &projection, now);
+        }
         self.apply_overlay_results(
             OverlayResults {
                 pane_actions,
@@ -492,7 +565,8 @@ impl ChartCard {
             },
             bars.len(),
         );
-        body::report_hover(&mut pointer, &response, plot, &view, &projection);
+        let time = self.takes_part_in_sync(source).then(|| TimeAxis::new(bars));
+        body::report_hover(&mut pointer, &response, plot, &view, &projection, time);
 
         pointer.clicked = response.clicked();
         pointer

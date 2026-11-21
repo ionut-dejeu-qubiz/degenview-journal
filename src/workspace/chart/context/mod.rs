@@ -749,7 +749,11 @@ impl ChartWorkspace {
         // A selected table cell takes the clipboard keys for itself; the chart's draw this frame
         // handles them.
         let cell_selected = crate::ui::take_table_cell_selected(ctx);
-        if self.indicator_picker.is_open() || ctx.egui_wants_keyboard_input() || cell_selected {
+        if self.indicator_picker.is_open()
+            || self.studio_open()
+            || ctx.egui_wants_keyboard_input()
+            || cell_selected
+        {
             return;
         }
         let (copy, paste) = ui.input(|input| {
@@ -1060,7 +1064,7 @@ impl ChartWorkspace {
         };
         let title = format!("{} {}", self.charts[index].symbol, self.timeframe.label());
         let hours = session_stats::MarketHours::for_source(self.charts[index].source);
-        let bar_ms = session_stats::bar_ms(self.timeframe);
+        let bar_ms = self.timeframe.nominal_ms();
         // The chart data borrows the workspace, so the panel's state is lent out for the frame.
         let mut state = std::mem::take(&mut self.context.stats);
         let action = {
